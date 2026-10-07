@@ -40,6 +40,17 @@ DEFAULT_UNIVERSE = [
     "WDC", "STX",
 ]
 
+COMPARISON_LABELS = {
+    "SPY": "SPY",
+    "QQQ": "QQQ",
+    "FWD": "AB Disruptors ETF (FWD)",
+    "AB_INTL_TECH": "AB International Technology",
+}
+
+# LU0060230025 / XAY5 trades on several German venues. Yahoo suffix
+# availability can vary, so try multiple venues instead of hard-coding one.
+AB_INTL_TECH_YAHOO_CANDIDATES = ["XAY5.F", "XAY5.DE", "XAY5.SG", "XAY5.BE"]
+
 
 @dataclass
 class BacktestConfig:
@@ -92,6 +103,78 @@ def _download(symbols: List[str], start: pd.Timestamp, end: pd.Timestamp) -> Dic
             s = symbols[0]
             out[s] = raw.dropna(subset=["Close"]).copy()
     return out
+
+
+def _download_ab_intl_tech_usd(start: pd.Timestamp, end: pd.Timestamp) -> Tuple[Optional[pd.Series], Optional[str]]:
+    """Best-effort USD price proxy for AB International Technology A USD.
+
+    The share class is LU0060230025 (XAY5). Yahoo does not expose the Luxembourg
+    USD NAV under a stable symbol, so we use an exchange-traded EUR quote when
+    available and convert it back to USD with EURUSD=X.
+    """
+    for candidate in AB_INTL_TECH_YAHOO_CANDIDATES:
+        frames = _download([candidate], start, end)
+        frame = frames.get(candidate)
+        if frame is None or frame.empty or "Close" not in frame:
+            continue
+        close_eur = frame["Close"].dropna().astype(float)
+        if close_eur.empty:
+            continue
+
+        fx_frames = _download(["EURUSD=X"], start, end)
+        fx = fx_frames.get("EURUSD=X")
+        if fx is not None and not fx.empty and "Close" in fx:
+            fx_close = fx["Close"].dropna().astype(float)
+            fx_close = fx_close.reindex(close_eur.index).ffill()
+            converted = (close_eur * fx_close).dropna()
+            if not converted.empty:
+                return converted, candidate
+
+        # If FX is temporarily unavailable, a local-currency normalized series is
+        # still better than dropping the comparison entirely.
+        return close_eur, candidate
+    return None, None
+
+
+def _anchor_comparison(
+    close: pd.Series,
+    equity: pd.DataFrame,
+) -> Optional[pd.Series]:
+    """Align a benchmark to the portfolio value on its first available date."""
+    if close is None or close.empty or equity.empty:
+        return None
+    close = close[~close.index.duplicated(keep="last")].sort_index()
+    aligned = close.reindex(equity.index).ffill()
+    first = aligned.first_valid_index()
+    if first is None:
+        return None
+    base = float(aligned.loc[first])
+    if not np.isfinite(base) or base <= 0:
+        return None
+    anchor = float(equity.loc[first, "portfolio"])
+    result = aligned / base * anchor
+    result.loc[result.index < first] = np.nan
+    return result
+
+
+def _comparison_stats(name: str, series: pd.Series, equity: pd.DataFrame) -> Optional[dict]:
+    valid = series.dropna()
+    if valid.empty:
+        return None
+    first, last = valid.index[0], valid.index[-1]
+    benchmark_return = float(valid.iloc[-1] / valid.iloc[0] - 1)
+    p = equity.loc[first:last, "portfolio"].dropna()
+    if p.empty:
+        return None
+    portfolio_return = float(p.iloc[-1] / p.iloc[0] - 1)
+    return {
+        "name": name,
+        "start_date": pd.Timestamp(first),
+        "end_date": pd.Timestamp(last),
+        "benchmark_return": benchmark_return,
+        "buyntiq_return_same_period": portfolio_return,
+        "alpha_same_period": portfolio_return - benchmark_return,
+    }
 
 
 def _quarterly_schedule(start: pd.Timestamp, end: pd.Timestamp, months: int) -> List[pd.Timestamp]:
@@ -223,7 +306,8 @@ def run_backtest(universe: Iterable[str], cfg: BacktestConfig, progress=None):
     end = pd.Timestamp(cfg.end) if cfg.end else pd.Timestamp.today().normalize()
     # Extra history is required so a 2021 decision can train only on pre-2021 rows.
     history_start = start - pd.DateOffset(years=8)
-    all_symbols = list(dict.fromkeys(universe + [cfg.benchmark]))
+    comparison_symbols = ["SPY", "QQQ", "FWD"]
+    all_symbols = list(dict.fromkeys(universe + comparison_symbols + [cfg.benchmark]))
     if progress:
         progress(.01, "Downloading historical prices")
     data = _download(all_symbols, history_start, end)
@@ -339,12 +423,51 @@ def run_backtest(universe: Iterable[str], cfg: BacktestConfig, progress=None):
         equity_rows.append({"date": date, "portfolio": value})
 
     equity = pd.DataFrame(equity_rows).set_index("date")
-    # Benchmark normalized to first tradable close in the period.
-    b = benchmark.loc[equity.index.min():equity.index.max(), "Close"].reindex(equity.index).ffill().dropna()
-    b = b / b.iloc[0] * cfg.starting_cash
-    equity["benchmark"] = b
+
+    # Build all comparison lines. Each line is anchored to Buyntiq's portfolio
+    # value on that benchmark's first available date, so later launches such as
+    # FWD are compared fairly instead of being backfilled into 2021.
+    comparisons = pd.DataFrame(index=equity.index)
+    comparison_meta = []
+    for symbol in ("SPY", "QQQ", "FWD"):
+        frame = data.get(symbol)
+        if frame is None or frame.empty or "Close" not in frame:
+            continue
+        series = _anchor_comparison(frame["Close"].dropna().astype(float), equity)
+        if series is None:
+            continue
+        label = COMPARISON_LABELS[symbol]
+        comparisons[label] = series
+        stats = _comparison_stats(label, series, equity)
+        if stats:
+            comparison_meta.append(stats)
+
+    ab_close, ab_source = _download_ab_intl_tech_usd(history_start, end)
+    if ab_close is not None:
+        ab_series = _anchor_comparison(ab_close, equity)
+        if ab_series is not None:
+            label = COMPARISON_LABELS["AB_INTL_TECH"]
+            comparisons[label] = ab_series
+            stats = _comparison_stats(label, ab_series, equity)
+            if stats:
+                stats["source_symbol"] = ab_source
+                comparison_meta.append(stats)
+
+    primary_label = COMPARISON_LABELS.get(cfg.benchmark, cfg.benchmark)
+    if primary_label not in comparisons:
+        # Primary benchmark should normally be SPY or QQQ, both downloaded above.
+        b = benchmark.loc[equity.index.min():equity.index.max(), "Close"].reindex(equity.index).ffill()
+        comparisons[primary_label] = _anchor_comparison(b.dropna().astype(float), equity)
+
+    equity["benchmark"] = comparisons[primary_label]
     equity["portfolio_return"] = equity.portfolio / cfg.starting_cash - 1
-    equity["benchmark_return"] = equity.benchmark / cfg.starting_cash - 1
+    primary_valid = equity["benchmark"].dropna()
+    equity["benchmark_return"] = np.nan
+    if not primary_valid.empty:
+        first_primary = primary_valid.index[0]
+        equity.loc[first_primary:, "benchmark_return"] = (
+            equity.loc[first_primary:, "benchmark"] / float(primary_valid.iloc[0]) - 1
+        )
 
     daily = equity.portfolio.pct_change().dropna()
     ann_return = (equity.portfolio.iloc[-1] / equity.portfolio.iloc[0]) ** (252 / max(len(daily), 1)) - 1
@@ -356,9 +479,12 @@ def run_backtest(universe: Iterable[str], cfg: BacktestConfig, progress=None):
         "start_value": cfg.starting_cash,
         "end_value": float(equity.portfolio.iloc[-1]),
         "total_return": float(equity.portfolio.iloc[-1] / cfg.starting_cash - 1),
-        "benchmark_end": float(equity.benchmark.iloc[-1]),
-        "benchmark_return": float(equity.benchmark.iloc[-1] / cfg.starting_cash - 1),
-        "alpha_vs_benchmark": float(equity.portfolio.iloc[-1] / cfg.starting_cash - equity.benchmark.iloc[-1] / cfg.starting_cash),
+        "benchmark_end": float(equity.benchmark.dropna().iloc[-1]),
+        "benchmark_return": float(equity.benchmark.dropna().iloc[-1] / equity.benchmark.dropna().iloc[0] - 1),
+        "alpha_vs_benchmark": float(
+            equity.portfolio.loc[equity.benchmark.dropna().index[-1]] / equity.portfolio.loc[equity.benchmark.dropna().index[0]]
+            - equity.benchmark.dropna().iloc[-1] / equity.benchmark.dropna().iloc[0]
+        ),
         "annualized_return": float(ann_return),
         "annualized_volatility": float(ann_vol),
         "sharpe_no_rf": float(sharpe) if np.isfinite(sharpe) else np.nan,
@@ -371,6 +497,8 @@ def run_backtest(universe: Iterable[str], cfg: BacktestConfig, progress=None):
     return {
         "summary": summary,
         "equity": equity,
+        "comparisons": comparisons,
+        "comparison_stats": pd.DataFrame(comparison_meta),
         "holdings": pd.DataFrame(holdings_log),
         "trades": pd.DataFrame(trades),
     }
