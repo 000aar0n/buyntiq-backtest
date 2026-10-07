@@ -13,9 +13,31 @@ from strategy import technical_analysis, forecast_return, combined_score, alloca
 
 
 DEFAULT_UNIVERSE = [
-    "AAPL", "MSFT", "NVDA", "AMD", "AVGO", "QCOM", "TXN", "AMAT", "MU", "ADI",
-    "KLAC", "LRCX", "ORCL", "CRM", "CSCO", "INTU", "ADBE", "NOW", "PANW", "ANET",
-    "IBM", "AMZN", "GOOGL", "META", "NFLX",
+    # Mega-cap / platforms / enterprise
+    "AAPL", "MSFT", "NVDA", "AMD", "AVGO", "ORCL", "CRM", "IBM", "AMZN", "GOOGL",
+    "META", "NFLX", "ADBE", "INTU", "NOW", "ADSK", "CDNS", "SNPS", "FICO", "PLTR",
+
+    # Semiconductors / equipment
+    "QCOM", "TXN", "AMAT", "MU", "ADI", "KLAC", "LRCX", "ASML", "TSM", "NXPI",
+    "MCHP", "MPWR", "ON", "GFS", "MRVL", "SWKS", "TER", "ENTG", "COHR", "QRVO",
+    "ACLS", "AEHR", "AMKR", "FORM", "MKSI", "IPGP", "SITM", "ALGM", "POWI", "DIOD",
+    "SLAB", "CRUS", "NVMI", "CAMT",
+
+    # Networking / hardware / infrastructure
+    "CSCO", "ANET", "DELL", "HPE", "HPQ", "NTAP", "PSTG", "GLW", "AKAM", "FFIV",
+    "KEYS", "LOGI", "CIEN", "CDW", "JBL", "FLEX", "SMCI", "VRT",
+
+    # Cybersecurity / cloud / software
+    "PANW", "FTNT", "CRWD", "ZS", "OKTA", "DDOG", "NET", "MDB", "HUBS", "TEAM",
+    "DOCU", "U", "PATH", "APP", "SHOP", "WDAY", "SNOW", "MNDY", "GTLB", "CFLT",
+    "ESTC", "DT", "IOT", "TWLO", "ZM", "DOCN", "BILL", "GEN", "CHKP", "CYBR",
+    "NICE",
+
+    # IT services / international tech listed in the U.S.
+    "ACN", "CTSH", "EPAM", "PAYC", "PAYX", "SAP", "INFY",
+
+    # Storage
+    "WDC", "STX",
 ]
 
 
