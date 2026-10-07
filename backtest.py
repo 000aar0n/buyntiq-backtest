@@ -307,13 +307,14 @@ def run_backtest(universe: Iterable[str], cfg: BacktestConfig, progress=None):
     # Extra history is required so a 2021 decision can train only on pre-2021 rows.
     history_start = start - pd.DateOffset(years=8)
     comparison_symbols = ["SPY", "QQQ", "FWD"]
-    all_symbols = list(dict.fromkeys(universe + comparison_symbols + [cfg.benchmark]))
+    direct_primary = cfg.benchmark if cfg.benchmark in comparison_symbols else None
+    all_symbols = list(dict.fromkeys(universe + comparison_symbols + ([direct_primary] if direct_primary else [])))
     if progress:
         progress(.01, "Downloading historical prices")
     data = _download(all_symbols, history_start, end)
-    if cfg.benchmark not in data:
-        raise ValueError(f"Benchmark {cfg.benchmark} could not be downloaded")
-    benchmark = data[cfg.benchmark]
+    if "SPY" not in data:
+        raise ValueError("SPY could not be downloaded for the trading calendar")
+    benchmark = data["SPY"]
     stock_data = {s: data[s] for s in universe if s in data}
     if len(stock_data) < cfg.holdings:
         raise ValueError(f"Only {len(stock_data)} symbols downloaded successfully; need at least {cfg.holdings}.")
@@ -455,9 +456,10 @@ def run_backtest(universe: Iterable[str], cfg: BacktestConfig, progress=None):
 
     primary_label = COMPARISON_LABELS.get(cfg.benchmark, cfg.benchmark)
     if primary_label not in comparisons:
-        # Primary benchmark should normally be SPY or QQQ, both downloaded above.
-        b = benchmark.loc[equity.index.min():equity.index.max(), "Close"].reindex(equity.index).ffill()
-        comparisons[primary_label] = _anchor_comparison(b.dropna().astype(float), equity)
+        raise ValueError(
+            f"Primary benchmark {primary_label} is unavailable for this run. "
+            "Choose another benchmark or retry if the data provider was temporarily unavailable."
+        )
 
     equity["benchmark"] = comparisons[primary_label]
     equity["portfolio_return"] = equity.portfolio / cfg.starting_cash - 1
