@@ -169,112 +169,149 @@ def feature_frame(prices: pd.DataFrame) -> pd.DataFrame:
     return f.replace([np.inf, -np.inf], np.nan)
 
 
-def _models():
+def _models(mode: str = "fast"):
+    """Same Buyntiq model family, with a much smaller fast backtest configuration."""
+    fast = mode == "fast"
     return {
         "Ridge": make_pipeline(StandardScaler(), Ridge(alpha=40)),
         "Extra Trees": ExtraTreesRegressor(
-            n_estimators=56, max_depth=6, min_samples_leaf=18,
-            max_features=.8, n_jobs=1, random_state=42,
+            n_estimators=20 if fast else 56,
+            max_depth=5 if fast else 6,
+            min_samples_leaf=22 if fast else 18,
+            max_features=.75 if fast else .8,
+            n_jobs=1,
+            random_state=42,
         ),
         "Gradient Boosting": HistGradientBoostingRegressor(
-            max_iter=70, max_leaf_nodes=9, l2_regularization=12,
-            learning_rate=.045, min_samples_leaf=25, early_stopping=False,
+            max_iter=35 if fast else 70,
+            max_leaf_nodes=7 if fast else 9,
+            l2_regularization=12,
+            learning_rate=.05 if fast else .045,
+            min_samples_leaf=28 if fast else 25,
+            early_stopping=False,
             random_state=42,
         ),
     }
 
 
-def forecast_return(prices: pd.DataFrame, horizon: int = 63) -> dict:
-    """Walk-forward stock-only Buyntiq-style forecast with no future rows visible.
+def _fit_member_predictions(x, y, scale, train, test_x, test_scale, mode: str):
+    target_scaled = y.iloc[train].to_numpy() / scale.iloc[train].to_numpy()
+    lo, hi = np.quantile(target_scaled, [.01, .99])
+    preds = {}
+    for name, model in _models(mode).items():
+        model.fit(x.iloc[train], np.clip(target_scaled, lo, hi))
+        preds[name] = np.clip(model.predict(test_x), -8, 8) * np.asarray(test_scale)
+    return preds
 
-    This intentionally avoids current market/sector metadata and current company data.
-    It is designed for historical backtesting, where point-in-time correctness matters
-    more than reproducing a present-day provider snapshot.
+
+def forecast_return(prices: pd.DataFrame, horizon: int = 63, mode: str = "fast") -> dict:
+    """Point-in-time Buyntiq-style stock forecast.
+
+    fast:
+        One chronological validation block + smaller versions of the same three
+        production model families. Designed for repeated quarterly backtests.
+
+    full:
+        Three time-series validation folds and the larger production-style
+        model settings. Much slower on throttled CPUs.
     """
+    if mode not in ("fast", "full"):
+        raise ValueError("mode must be 'fast' or 'full'")
+
     f = feature_frame(prices)
     target = np.log(prices.Close.shift(-horizon) / prices.Close)
     scale = f.volatility_63.clip(lower=.003) * np.sqrt(horizon)
     joined = f.assign(_target=target, _scale=scale).dropna()
-    if len(joined) < max(700, 3 * horizon + 350):
-        # Honest statistical fallback when a symbol lacks enough history.
+
+    if len(joined) < max(560 if mode == "fast" else 700, 3 * horizon + 300):
         c = prices.Close.dropna().astype(float)
         if len(c) < horizon + 252:
             return {"available": False, "predicted_return": np.nan, "evidence_weight": 0.0, "kind": "Unavailable"}
         hist = np.log(c / c.shift(horizon)).dropna().tail(504)
         pred = float(hist.median()) if len(hist) else 0.0
-        return {"available": True, "predicted_return": float(np.expm1(pred)), "evidence_weight": 0.0, "kind": "Historical median"}
+        return {"available": True, "predicted_return": float(np.expm1(pred)),
+                "evidence_weight": 0.0, "kind": "Historical median"}
 
     x = joined[f.columns]
     y = joined._target
-    s = joined._scale
+    sc = joined._scale
     current = f.iloc[[-1]].dropna(axis=1)
     cols = [c for c in x.columns if c in current.columns]
-    x = x[cols]
-    current = current[cols]
+    x, current = x[cols], current[cols]
     if current.empty or not np.isfinite(current.to_numpy()).all():
         return {"available": False, "predicted_return": np.nan, "evidence_weight": 0.0, "kind": "Unavailable"}
 
-    # Reserve the latest year for a genuine holdout and use only earlier data for model choice.
-    holdout_n = min(252, max(horizon, 126))
-    dev_end = len(x) - holdout_n - horizon
-    if dev_end < 450:
-        return {"available": False, "predicted_return": np.nan, "evidence_weight": 0.0, "kind": "Unavailable"}
+    names = list(_models(mode))
+    actual_parts = []
+    pred_parts = {name: [] for name in names}
 
-    dev_x, dev_y, dev_s = x.iloc[:dev_end], y.iloc[:dev_end], s.iloc[:dev_end]
-    test_size = min(max(84, horizon), max(42, (len(dev_x) - horizon - 250) // 3))
-    splitter = TimeSeriesSplit(n_splits=3, test_size=test_size, gap=horizon)
-    names = list(_models())
-    oof = {name: [] for name in names}
-    actual = []
+    if mode == "fast":
+        # One non-overlapping chronological validation block. Training labels
+        # end at least one forecast horizon before validation starts.
+        validation_size = min(84, max(42, horizon))
+        val_start = len(x) - validation_size
+        train_end = val_start - horizon
+        if train_end < 300:
+            return {"available": False, "predicted_return": np.nan, "evidence_weight": 0.0, "kind": "Unavailable"}
+        train = np.arange(train_end)
+        test = np.arange(val_start, len(x))
+        member = _fit_member_predictions(x, y, sc, train, x.iloc[test], sc.iloc[test].to_numpy(), mode)
+        actual_parts.append(y.iloc[test].to_numpy())
+        for name in names:
+            pred_parts[name].append(member[name])
+    else:
+        holdout_n = min(252, max(horizon, 126))
+        dev_end = len(x) - holdout_n - horizon
+        if dev_end < 450:
+            return {"available": False, "predicted_return": np.nan, "evidence_weight": 0.0, "kind": "Unavailable"}
+        dev_x = x.iloc[:dev_end]
+        test_size = min(max(84, horizon), max(42, (len(dev_x) - horizon - 250) // 3))
+        splitter = TimeSeriesSplit(n_splits=3, test_size=test_size, gap=horizon)
+        for train, test in splitter.split(dev_x):
+            member = _fit_member_predictions(
+                x, y, sc, train, x.iloc[test], sc.iloc[test].to_numpy(), mode
+            )
+            actual_parts.append(y.iloc[test].to_numpy())
+            for name in names:
+                pred_parts[name].append(member[name])
 
-    for train, test in splitter.split(dev_x):
-        actual.extend(dev_y.iloc[test])
-        target_scaled = dev_y.iloc[train].to_numpy() / dev_s.iloc[train].to_numpy()
-        lo, hi = np.quantile(target_scaled, [.01, .99])
-        for name, model in _models().items():
-            model.fit(dev_x.iloc[train], np.clip(target_scaled, lo, hi))
-            pred = np.clip(model.predict(dev_x.iloc[test]), -8, 8) * dev_s.iloc[test].to_numpy()
-            oof[name].extend(pred)
-
-    actual = np.asarray(actual)
-    losses = {}
-    for name in names:
-        pred = np.asarray(oof[name])
-        losses[name] = float(np.mean(np.abs(np.expm1(actual) - np.expm1(pred))))
+    actual = np.concatenate(actual_parts)
+    predictions = {name: np.concatenate(pred_parts[name]) for name in names}
+    losses = {
+        name: float(np.mean(np.abs(np.expm1(actual) - np.expm1(predictions[name]))))
+        for name in names
+    }
     inv = {k: 1 / max(v, 1e-4) for k, v in losses.items()}
     weights = {k: .5 / len(names) + .5 * inv[k] / sum(inv.values()) for k in names}
-    blended = sum(weights[k] * np.asarray(oof[k]) for k in names)
-    baseline_log = float(dev_y.tail(252).median())
+    blended = sum(weights[k] * predictions[k] for k in names)
+
+    baseline_log = float(y.iloc[:max(1, len(y) - horizon)].tail(252).median())
     baseline = np.repeat(baseline_log, len(actual))
     blend_mae = float(np.mean(np.abs(np.expm1(actual) - np.expm1(blended))))
     base_mae = float(np.mean(np.abs(np.expm1(actual) - np.expm1(baseline))))
     alpha = 1.0 if blend_mae < 0.97 * base_mae else 0.0
 
-    # Final fit uses every matured target available at the as-of date.
-    mature_end = len(x) - horizon
-    train = np.arange(max(0, mature_end))
-    target_scaled = y.iloc[train].to_numpy() / s.iloc[train].to_numpy()
-    lo, hi = np.quantile(target_scaled, [.01, .99])
+    # joined already contains only matured targets, so this final fit remains causal.
+    train = np.arange(len(x))
     current_scale = max(float(f.volatility_63.iloc[-1]), .003) * np.sqrt(horizon)
-    preds = {}
-    for name, model in _models().items():
-        model.fit(x.iloc[train], np.clip(target_scaled, lo, hi))
-        preds[name] = float(np.clip(model.predict(current)[0], -8, 8) * current_scale)
-    raw_log = sum(weights[k] * preds[k] for k in names)
+    latest = _fit_member_predictions(
+        x, y, sc, train, current, np.asarray([current_scale]), mode
+    )
+    raw_log = float(sum(weights[k] * latest[k][0] for k in names))
     predicted_log = alpha * raw_log + (1 - alpha) * baseline_log
 
-    # Evidence weight follows Buyntiq's philosophy: ML gets little/no score weight unless validated.
     skill = 0.0 if base_mae <= 1e-9 else max(0.0, 1 - blend_mae / base_mae)
-    evidence = min(skill, .25) / .25 * alpha * .8
+    evidence = min(skill, .25) / .25 * alpha * (.55 if mode == "fast" else .8)
     return {
         "available": True,
         "predicted_return": float(np.expm1(predicted_log)),
         "raw_ml_return": float(np.expm1(raw_log)),
         "baseline_return": float(np.expm1(baseline_log)),
         "evidence_weight": float(np.clip(evidence, 0, .8)),
-        "kind": "Validated ensemble" if alpha else "Baseline fallback",
+        "kind": ("Fast validated ensemble" if mode == "fast" else "Validated ensemble") if alpha else "Baseline fallback",
         "ml_blend": alpha,
         "dev_skill": skill,
+        "mode": mode,
     }
 
 
