@@ -119,7 +119,7 @@ if st.button("Run 5-year backtest", type="primary", use_container_width=True):
 
     if "AB International Technology" not in result["comparisons"].columns:
         st.warning(
-            "AB International Technology (LU0060230025 / XAY5) could not be downloaded from Yahoo on this run. "
+            "AB International Technology (LU0060230025) could not be loaded on this run. "
             "SPY, QQQ, and FWD comparisons are still valid."
         )
 
