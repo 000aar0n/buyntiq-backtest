@@ -15,7 +15,12 @@ with st.sidebar:
     starting_cash = st.number_input("Starting cash", min_value=1000.0, value=100000.0, step=10000.0)
     holdings = st.slider("Holdings", 3, 25, 15)
     profile = st.selectbox("Risk profile", ["Conservative", "Balanced", "Aggressive"], index=1)
-    benchmark = st.selectbox("Benchmark", ["SPY", "QQQ"], index=0)
+    benchmark = st.selectbox(
+        "Primary benchmark for alpha",
+        ["SPY", "QQQ"],
+        index=0,
+        help="The chart also compares SPY, QQQ, FWD, and AB International Technology when data is available.",
+    )
     positive = st.checkbox("Require positive 3-month forecast", value=True)
     costs = st.number_input("Transaction cost (bps per trade)", min_value=0.0, max_value=100.0, value=10.0, step=1.0)
     whole = st.checkbox("Whole shares", value=False)
@@ -69,8 +74,19 @@ if st.button("Run 5-year backtest", type="primary", use_container_width=True):
     c3.metric("Return vs benchmark", f"{s['alpha_vs_benchmark']:+.1%}")
     c4.metric("Max drawdown", f"{s['max_drawdown']:.1%}")
 
-    chart = result["equity"][["portfolio", "benchmark"]].rename(columns={"portfolio": "Buyntiq", "benchmark": benchmark})
-    st.plotly_chart(px.line(chart, labels={"value": "Portfolio value", "date": "Date", "variable": "Series"}), use_container_width=True)
+    chart = result["comparisons"].copy()
+    chart.insert(0, "Buyntiq", result["equity"]["portfolio"])
+    st.plotly_chart(
+        px.line(
+            chart,
+            labels={"value": "Comparable portfolio value", "date": "Date", "variable": "Series"},
+        ),
+        use_container_width=True,
+    )
+    st.caption(
+        "Later-starting benchmarks are anchored to Buyntiq's value on their first available date. "
+        "FWD therefore starts at its actual history instead of being backfilled."
+    )
 
     st.subheader("Stats")
     stats = pd.DataFrame({
@@ -82,6 +98,29 @@ if st.button("Run 5-year backtest", type="primary", use_container_width=True):
     })
     st.dataframe(stats, hide_index=True, use_container_width=True)
 
+    st.subheader("Benchmark comparisons")
+    comparisons = result["comparison_stats"].copy()
+    if not comparisons.empty:
+        comparisons["Start"] = pd.to_datetime(comparisons["start_date"]).dt.strftime("%Y-%m-%d")
+        comparisons["End"] = pd.to_datetime(comparisons["end_date"]).dt.strftime("%Y-%m-%d")
+        comparisons["Benchmark return"] = comparisons["benchmark_return"].map(lambda x: f"{x:+.2%}")
+        comparisons["Buyntiq same period"] = comparisons["buyntiq_return_same_period"].map(lambda x: f"{x:+.2%}")
+        comparisons["Buyntiq edge"] = comparisons["alpha_same_period"].map(lambda x: f"{x:+.2%}")
+        show_cols = ["name", "Start", "End", "Benchmark return", "Buyntiq same period", "Buyntiq edge"]
+        st.dataframe(
+            comparisons[show_cols].rename(columns={"name": "Benchmark"}),
+            hide_index=True,
+            use_container_width=True,
+        )
+    else:
+        st.warning("No comparison benchmark histories were available.")
+
+    if "AB International Technology" not in result["comparisons"].columns:
+        st.warning(
+            "AB International Technology (LU0060230025 / XAY5) could not be downloaded from Yahoo on this run. "
+            "SPY, QQQ, and FWD comparisons are still valid."
+        )
+
     st.subheader("Quarterly holdings")
     st.dataframe(result["holdings"], hide_index=True, use_container_width=True)
     st.download_button("Download holdings CSV", result["holdings"].to_csv(index=False), "buyntiq_backtest_holdings.csv", "text/csv")
@@ -90,4 +129,9 @@ if st.button("Run 5-year backtest", type="primary", use_container_width=True):
     st.dataframe(result["trades"], hide_index=True, use_container_width=True)
     st.download_button("Download trades CSV", result["trades"].to_csv(index=False), "buyntiq_backtest_trades.csv", "text/csv")
 
-st.info("Historical fundamentals are intentionally not pulled from today's Yahoo company snapshot. Using today's fundamentals in 2021 would leak future information. Fast mode is recommended on throttled CPUs; Full validation is intentionally much slower.")
+st.info(
+    "Historical fundamentals are intentionally not pulled from today's Yahoo company snapshot. "
+    "Using today's fundamentals in 2021 would leak future information. Fast mode is recommended on throttled CPUs; "
+    "Full validation is intentionally much slower. AB International Technology uses the LU0060230025/XAY5 exchange "
+    "quote when available and converts the EUR quote to USD for a closer share-class comparison."
+)
