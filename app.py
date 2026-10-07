@@ -2,7 +2,7 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-from backtest import BacktestConfig, DEFAULT_UNIVERSE, run_backtest
+from backtest import BacktestConfig, COMPARISON_LABELS, DEFAULT_UNIVERSE, run_backtest
 
 st.set_page_config(page_title="Buyntiq Backtest", layout="wide")
 st.title("Buyntiq · 5-Year Portfolio Backtest")
@@ -17,9 +17,10 @@ with st.sidebar:
     profile = st.selectbox("Risk profile", ["Conservative", "Balanced", "Aggressive"], index=1)
     benchmark = st.selectbox(
         "Primary benchmark for alpha",
-        ["SPY", "QQQ"],
+        ["SPY", "QQQ", "FWD", "AB_INTL_TECH"],
         index=0,
-        help="The chart also compares SPY, QQQ, FWD, and AB International Technology when data is available.",
+        format_func=lambda x: COMPARISON_LABELS.get(x, x),
+        help="Choose SPY, QQQ, AB Disruptors ETF (FWD), or AB International Technology.",
     )
     positive = st.checkbox("Require positive 3-month forecast", value=True)
     costs = st.number_input("Transaction cost (bps per trade)", min_value=0.0, max_value=100.0, value=10.0, step=1.0)
@@ -70,7 +71,8 @@ if st.button("Run 5-year backtest", type="primary", use_container_width=True):
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Ending value", f"${s['end_value']:,.0f}", f"{s['total_return']:+.1%}")
-    c2.metric(f"{benchmark} ending value", f"${s['benchmark_end']:,.0f}", f"{s['benchmark_return']:+.1%}")
+    benchmark_label = COMPARISON_LABELS.get(benchmark, benchmark)
+    c2.metric(f"{benchmark_label} ending value", f"${s['benchmark_end']:,.0f}", f"{s['benchmark_return']:+.1%}")
     c3.metric("Return vs benchmark", f"{s['alpha_vs_benchmark']:+.1%}")
     c4.metric("Max drawdown", f"{s['max_drawdown']:.1%}")
 
