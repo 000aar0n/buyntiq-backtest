@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
+from ab_benchmark import load_ab_intl_tech
 from strategy import technical_analysis, forecast_return, combined_score, allocate
 
 
@@ -443,8 +444,13 @@ def run_backtest(universe: Iterable[str], cfg: BacktestConfig, progress=None):
         if stats:
             comparison_meta.append(stats)
 
-    ab_close, ab_source = _download_ab_intl_tech_usd(history_start, end)
-    if ab_close is not None:
+    # Prefer the fund's own NAV history. Yahoo's XAY5 venue aliases are
+    # inconsistent, so keep them only as a fallback.
+    ab_close = load_ab_intl_tech(history_start, end)
+    ab_source = "Morningstar F0GBR04I8U"
+    if ab_close is None or ab_close.empty:
+        ab_close, ab_source = _download_ab_intl_tech_usd(history_start, end)
+    if ab_close is not None and not ab_close.empty:
         ab_series = _anchor_comparison(ab_close, equity)
         if ab_series is not None:
             label = COMPARISON_LABELS["AB_INTL_TECH"]
