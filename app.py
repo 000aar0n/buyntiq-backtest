@@ -19,6 +19,20 @@ with st.sidebar:
     positive = st.checkbox("Require positive 3-month forecast", value=True)
     costs = st.number_input("Transaction cost (bps per trade)", min_value=0.0, max_value=100.0, value=10.0, step=1.0)
     whole = st.checkbox("Whole shares", value=False)
+    speed = st.selectbox(
+        "Model mode",
+        ["Fast (recommended)", "Full validation (slow)"],
+        index=0,
+        help="Fast keeps the same three model families but uses one chronological validation block and smaller tree/boosting models. Full uses three validation folds and larger models.",
+    )
+    finalists = st.number_input(
+        "ML finalists per rebalance",
+        min_value=int(holdings),
+        max_value=100,
+        value=max(int(holdings), 18),
+        step=1,
+        help="Every stock gets the cheap technical screen. Only these top candidates get the expensive ML retraining.",
+    )
 
 symbols_text = st.text_area(
     "Universe (comma-separated)",
@@ -33,9 +47,20 @@ if st.button("Run 5-year backtest", type="primary", use_container_width=True):
         start=str(start), end=str(end), holdings=holdings, starting_cash=starting_cash,
         profile=profile, benchmark=benchmark, positive_forecast_only=positive,
         transaction_cost_bps=costs, whole_shares=whole,
+        model_mode="fast" if speed.startswith("Fast") else "full",
+        finalists=int(finalists),
     )
-    with st.spinner("Downloading history and rebuilding the portfolio at each quarter..."):
-        result = run_backtest(symbols, cfg)
+    bar = st.progress(0.0, text="Preparing backtest")
+    try:
+        result = run_backtest(
+            symbols,
+            cfg,
+            progress=lambda fraction, message: bar.progress(
+                min(max(float(fraction), 0.0), 1.0), text=message
+            ),
+        )
+    finally:
+        bar.empty()
     s = result["summary"]
 
     c1, c2, c3, c4 = st.columns(4)
@@ -65,4 +90,4 @@ if st.button("Run 5-year backtest", type="primary", use_container_width=True):
     st.dataframe(result["trades"], hide_index=True, use_container_width=True)
     st.download_button("Download trades CSV", result["trades"].to_csv(index=False), "buyntiq_backtest_trades.csv", "text/csv")
 
-st.info("Historical fundamentals are intentionally not pulled from today's Yahoo company snapshot. Using today's fundamentals in 2021 would leak future information. Add a point-in-time fundamentals dataset later if you want the full production Company score in every historical rebalance.")
+st.info("Historical fundamentals are intentionally not pulled from today's Yahoo company snapshot. Using today's fundamentals in 2021 would leak future information. Fast mode is recommended on throttled CPUs; Full validation is intentionally much slower.")
