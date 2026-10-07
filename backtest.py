@@ -32,6 +32,8 @@ class BacktestConfig:
     positive_forecast_only: bool = True
     transaction_cost_bps: float = 10.0
     whole_shares: bool = False
+    model_mode: str = "fast"
+    finalists: int = 18
 
 
 def _download(symbols: List[str], start: pd.Timestamp, end: pd.Timestamp) -> Dict[str, pd.DataFrame]:
@@ -107,8 +109,25 @@ def _mark_price(frame: pd.DataFrame, date: pd.Timestamp) -> Optional[float]:
     return float(hist.iloc[-1]) if len(hist) else None
 
 
-def rank_universe(price_data: Dict[str, pd.DataFrame], as_of: pd.Timestamp, horizon: int, positive_only: bool) -> pd.DataFrame:
-    rows = []
+def rank_universe(
+    price_data: Dict[str, pd.DataFrame],
+    as_of: pd.Timestamp,
+    horizon: int,
+    positive_only: bool,
+    count: int,
+    finalists: int,
+    model_mode: str,
+    progress=None,
+    progress_base: float = 0.0,
+    progress_span: float = 0.0,
+) -> pd.DataFrame:
+    """Fast two-stage screen: technical score first, ML only for finalists.
+
+    This mirrors the live Buyntiq builder's architecture and avoids spending
+    CPU on deep ML for names that cannot make the final portfolio.
+    """
+    technical_rows = []
+    histories = {}
     for symbol, frame in price_data.items():
         hist = frame.loc[:as_of].copy()
         if len(hist) < 260:
@@ -116,28 +135,65 @@ def rank_universe(price_data: Dict[str, pd.DataFrame], as_of: pd.Timestamp, hori
         tech = technical_analysis(hist)
         if not tech:
             continue
-        forecast = forecast_return(hist, horizon=horizon)
-        pred = float(forecast.get("predicted_return", np.nan)) if forecast else np.nan
-        if positive_only and (not np.isfinite(pred) or pred <= 0):
-            continue
-        score, components = combined_score(tech["technical_score"], forecast)
-        rows.append({
+        histories[symbol] = hist
+        technical_rows.append({
             "ticker": symbol,
-            "score": score,
             "technical_score": tech["technical_score"],
-            "forecast_return": pred,
-            "forecast_kind": forecast.get("kind") if forecast else "Unavailable",
-            "ml_evidence_weight": forecast.get("evidence_weight", 0.0) if forecast else 0.0,
             "annualized_volatility": tech["annualized_volatility"],
             "price_asof": tech["price"],
             "rsi": tech["rsi"],
         })
-    if not rows:
+
+    if not technical_rows:
         return pd.DataFrame()
-    return pd.DataFrame(rows).sort_values(["score", "ticker"], ascending=[False, True]).reset_index(drop=True)
 
+    screen = pd.DataFrame(technical_rows).sort_values(
+        ["technical_score", "ticker"], ascending=[False, True]
+    ).reset_index(drop=True)
 
-def run_backtest(universe: Iterable[str], cfg: BacktestConfig):
+    target_finalists = min(len(screen), max(count, int(finalists)))
+    analyzed = []
+    next_idx = 0
+    batch_size = max(3, min(6, count // 2 or 3))
+
+    while next_idx < len(screen) and (next_idx < target_finalists or len(analyzed) < count):
+        stop = min(len(screen), max(target_finalists, next_idx + batch_size))
+        batch = screen.iloc[next_idx:stop]
+        for row in batch.itertuples(index=False):
+            symbol = row.ticker
+            forecast = forecast_return(histories[symbol], horizon=horizon, mode=model_mode)
+            pred = float(forecast.get("predicted_return", np.nan)) if forecast else np.nan
+            if positive_only and (not np.isfinite(pred) or pred <= 0):
+                next_idx += 1
+                continue
+            score, _ = combined_score(row.technical_score, forecast)
+            analyzed.append({
+                "ticker": symbol,
+                "score": score,
+                "technical_score": row.technical_score,
+                "forecast_return": pred,
+                "forecast_kind": forecast.get("kind") if forecast else "Unavailable",
+                "ml_evidence_weight": forecast.get("evidence_weight", 0.0) if forecast else 0.0,
+                "annualized_volatility": row.annualized_volatility,
+                "price_asof": row.price_asof,
+                "rsi": row.rsi,
+            })
+            next_idx += 1
+            if progress and progress_span:
+                frac = min(1.0, next_idx / max(target_finalists, 1))
+                progress(progress_base + progress_span * frac, f"ML finalists · {next_idx}/{target_finalists}")
+        if len(analyzed) >= count and next_idx >= target_finalists:
+            break
+        if next_idx >= len(screen):
+            break
+
+    if not analyzed:
+        return pd.DataFrame()
+    return pd.DataFrame(analyzed).sort_values(
+        ["score", "ticker"], ascending=[False, True]
+    ).reset_index(drop=True)
+
+def run_backtest(universe: Iterable[str], cfg: BacktestConfig, progress=None):
     universe = list(dict.fromkeys(s.upper().strip() for s in universe if s.strip()))
     if not universe:
         raise ValueError("Universe is empty")
@@ -146,6 +202,8 @@ def run_backtest(universe: Iterable[str], cfg: BacktestConfig):
     # Extra history is required so a 2021 decision can train only on pre-2021 rows.
     history_start = start - pd.DateOffset(years=8)
     all_symbols = list(dict.fromkeys(universe + [cfg.benchmark]))
+    if progress:
+        progress(.01, "Downloading historical prices")
     data = _download(all_symbols, history_start, end)
     if cfg.benchmark not in data:
         raise ValueError(f"Benchmark {cfg.benchmark} could not be downloaded")
@@ -172,12 +230,24 @@ def run_backtest(universe: Iterable[str], cfg: BacktestConfig):
         if td is not None:
             rebalance_map[td] = scheduled
 
+    rebalance_dates = sorted(rebalance_map)
+    total_rebalances = max(len(rebalance_dates), 1)
+    completed_rebalances = 0
+
     for date in calendar:
         date = pd.Timestamp(date)
         if date in rebalance_map:
             sig = _signal_date(calendar, date)
             if sig is not None:
-                ranking = rank_universe(stock_data, sig, cfg.horizon, cfg.positive_forecast_only)
+                base = .05 + .88 * completed_rebalances / total_rebalances
+                span = .88 / total_rebalances
+                if progress:
+                    progress(base, f"Rebalance {completed_rebalances + 1}/{total_rebalances} · technical screen")
+                ranking = rank_universe(
+                    stock_data, sig, cfg.horizon, cfg.positive_forecast_only,
+                    count=cfg.holdings, finalists=cfg.finalists, model_mode=cfg.model_mode,
+                    progress=progress, progress_base=base, progress_span=span * .9,
+                )
                 if not ranking.empty:
                     chosen = allocate(ranking, min(cfg.holdings, len(ranking)), cfg.profile)
                     # Liquidate everything at next-session open.
@@ -234,6 +304,11 @@ def run_backtest(universe: Iterable[str], cfg: BacktestConfig):
                             "shares": qty,
                         })
 
+            completed_rebalances += 1
+            if progress:
+                progress(.05 + .88 * completed_rebalances / total_rebalances,
+                         f"Completed rebalance {completed_rebalances}/{total_rebalances}")
+
         value = cash
         for s, qty in shares.items():
             px = _mark_price(stock_data[s], date)
@@ -269,6 +344,8 @@ def run_backtest(universe: Iterable[str], cfg: BacktestConfig):
         "transaction_costs": float(costs_total),
         "rebalances": int(pd.DataFrame(holdings_log).rebalance_date.nunique()) if holdings_log else 0,
     }
+    if progress:
+        progress(1.0, "Backtest complete")
     return {
         "summary": summary,
         "equity": equity,
