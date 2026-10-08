@@ -10,7 +10,9 @@ import pandas as pd
 import yfinance as yf
 
 from ab_benchmark import load_ab_intl_tech
+from price_store import download_prices
 from strategy import technical_analysis, forecast_return, combined_score, allocate
+from threadpoolctl import threadpool_limits
 
 
 DEFAULT_UNIVERSE = [
@@ -48,16 +50,12 @@ COMPARISON_LABELS = {
     "AB_INTL_TECH": "AB International Technology",
 }
 
-# LU0060230025 / XAY5 trades on several German venues. Yahoo suffix
-# availability can vary, so try multiple venues instead of hard-coding one.
-AB_INTL_TECH_YAHOO_CANDIDATES = ["XAY5.F", "XAY5.DE", "XAY5.SG", "XAY5.BE"]
-
-
 @dataclass
 class BacktestConfig:
     start: str = "2021-10-07"
     end: Optional[str] = None
     rebalance_months: int = 3
+    rebalance_weeks: Optional[int] = None
     holdings: int = 15
     starting_cash: float = 100_000.0
     profile: str = "Balanced"
@@ -78,7 +76,8 @@ def _download(symbols: List[str], start: pd.Timestamp, end: pd.Timestamp) -> Dic
         auto_adjust=True,
         actions=False,
         group_by="column",
-        threads=True,
+        threads=4,
+        timeout=15,
         progress=False,
     )
     out = {}
@@ -106,37 +105,6 @@ def _download(symbols: List[str], start: pd.Timestamp, end: pd.Timestamp) -> Dic
     return out
 
 
-def _download_ab_intl_tech_usd(start: pd.Timestamp, end: pd.Timestamp) -> Tuple[Optional[pd.Series], Optional[str]]:
-    """Best-effort USD price proxy for AB International Technology A USD.
-
-    The share class is LU0060230025 (XAY5). Yahoo does not expose the Luxembourg
-    USD NAV under a stable symbol, so we use an exchange-traded EUR quote when
-    available and convert it back to USD with EURUSD=X.
-    """
-    for candidate in AB_INTL_TECH_YAHOO_CANDIDATES:
-        frames = _download([candidate], start, end)
-        frame = frames.get(candidate)
-        if frame is None or frame.empty or "Close" not in frame:
-            continue
-        close_eur = frame["Close"].dropna().astype(float)
-        if close_eur.empty:
-            continue
-
-        fx_frames = _download(["EURUSD=X"], start, end)
-        fx = fx_frames.get("EURUSD=X")
-        if fx is not None and not fx.empty and "Close" in fx:
-            fx_close = fx["Close"].dropna().astype(float)
-            fx_close = fx_close.reindex(close_eur.index).ffill()
-            converted = (close_eur * fx_close).dropna()
-            if not converted.empty:
-                return converted, candidate
-
-        # If FX is temporarily unavailable, a local-currency normalized series is
-        # still better than dropping the comparison entirely.
-        return close_eur, candidate
-    return None, None
-
-
 def _anchor_comparison(
     close: pd.Series,
     equity: pd.DataFrame,
@@ -145,7 +113,14 @@ def _anchor_comparison(
     if close is None or close.empty or equity.empty:
         return None
     close = close[~close.index.duplicated(keep="last")].sort_index()
-    aligned = close.reindex(equity.index).ffill()
+    # Fill only interior calendar gaps, never extend a benchmark past its
+    # last published observation or across an arbitrarily long missing period.
+    close = close.replace([np.inf, -np.inf], np.nan).dropna()
+    close = close[close > 0]
+    if len(close) < 2:return None
+    aligned = close.reindex(equity.index, method="ffill", tolerance=pd.Timedelta(days=5))
+    aligned.loc[aligned.index > close.index[-1]] = np.nan
+    if aligned.notna().sum() < 2:return None
     first = aligned.first_valid_index()
     if first is None:
         return None
@@ -160,7 +135,7 @@ def _anchor_comparison(
 
 def _comparison_stats(name: str, series: pd.Series, equity: pd.DataFrame) -> Optional[dict]:
     valid = series.dropna()
-    if valid.empty:
+    if len(valid) < 2:
         return None
     first, last = valid.index[0], valid.index[-1]
     benchmark_return = float(valid.iloc[-1] / valid.iloc[0] - 1)
@@ -178,12 +153,16 @@ def _comparison_stats(name: str, series: pd.Series, equity: pd.DataFrame) -> Opt
     }
 
 
-def _quarterly_schedule(start: pd.Timestamp, end: pd.Timestamp, months: int) -> List[pd.Timestamp]:
-    dates = []
-    d = start
-    while d <= end:
-        dates.append(d)
-        d = d + pd.DateOffset(months=months)
+def _quarterly_schedule(start, end, months=3, weeks=None):
+    if weeks is not None:
+        if not isinstance(weeks, int) or weeks < 1:raise ValueError("Rebalance weeks must be a positive integer")
+    elif not isinstance(months, int) or months < 1:
+        raise ValueError("Rebalance months must be a positive integer")
+    dates=[];i=0
+    while True:
+        d=start+(pd.DateOffset(weeks=weeks*i) if weeks is not None else pd.DateOffset(months=months*i))
+        if d>end:break
+        dates.append(d);i+=1
     return dates
 
 
@@ -205,14 +184,16 @@ def _signal_date(index: pd.DatetimeIndex, trade_date: pd.Timestamp) -> Optional[
 def _execution_price(frame: pd.DataFrame, date: pd.Timestamp) -> float:
     row = frame.loc[date]
     value = row.get("Open", np.nan)
-    if pd.isna(value) or value <= 0:
-        value = row["Close"]
+    if not np.isfinite(value) or value <= 0:
+        raise ValueError(f"Missing opening execution price on {date.date()}; no closing-price substitution was made.")
     return float(value)
 
 
 def _mark_price(frame: pd.DataFrame, date: pd.Timestamp) -> Optional[float]:
     hist = frame.loc[:date, "Close"].dropna()
-    return float(hist.iloc[-1]) if len(hist) else None
+    if not len(hist) or (date-hist.index[-1]).days > 7:
+        raise ValueError(f"A held stock has no recent closing price on {date.date()}; cannot value it safely.")
+    return float(hist.iloc[-1])
 
 
 def rank_universe(
@@ -233,15 +214,13 @@ def rank_universe(
     CPU on deep ML for names that cannot make the final portfolio.
     """
     technical_rows = []
-    histories = {}
     for symbol, frame in price_data.items():
         hist = frame.loc[:as_of].copy()
-        if len(hist) < 260:
+        if len(hist) < 260 or hist.index[-1] != as_of:
             continue
         tech = technical_analysis(hist)
         if not tech:
             continue
-        histories[symbol] = hist
         technical_rows.append({
             "ticker": symbol,
             "technical_score": tech["technical_score"],
@@ -267,9 +246,10 @@ def rank_universe(
         batch = screen.iloc[next_idx:stop]
         for row in batch.itertuples(index=False):
             symbol = row.ticker
-            forecast = forecast_return(histories[symbol], horizon=horizon, mode=model_mode)
+            with threadpool_limits(limits=1):
+                forecast = forecast_return(price_data[symbol].loc[:as_of], horizon=horizon, mode=model_mode)
             pred = float(forecast.get("predicted_return", np.nan)) if forecast else np.nan
-            if positive_only and (not np.isfinite(pred) or pred <= 0):
+            if not np.isfinite(pred) or not forecast.get("available") or (positive_only and pred <= 0):
                 next_idx += 1
                 continue
             score, _ = combined_score(row.technical_score, forecast)
@@ -303,8 +283,24 @@ def run_backtest(universe: Iterable[str], cfg: BacktestConfig, progress=None):
     universe = list(dict.fromkeys(s.upper().strip() for s in universe if s.strip()))
     if not universe:
         raise ValueError("Universe is empty")
-    start = pd.Timestamp(cfg.start)
-    end = pd.Timestamp(cfg.end) if cfg.end else pd.Timestamp.today().normalize()
+    start = pd.Timestamp(cfg.start).normalize()
+    end = pd.Timestamp(cfg.end).normalize() if cfg.end else pd.Timestamp.today().normalize()
+    if start >= end:raise ValueError("Start date must be before end date")
+    if start < pd.Timestamp("1980-01-01"):raise ValueError("Choose a start date in 1980 or later")
+    if not 1 <= cfg.holdings <= 100:raise ValueError("Holdings must be between 1 and 100")
+    if not np.isfinite(cfg.starting_cash) or cfg.starting_cash <= 0:raise ValueError("Starting cash must be positive")
+    if not np.isfinite(cfg.transaction_cost_bps) or not 0 <= cfg.transaction_cost_bps <= 100:raise ValueError("Trading costs must be between 0 and 100 bps")
+    if not isinstance(cfg.horizon,int) or not 1 <= cfg.horizon <= 252:raise ValueError("Forecast horizon must be between 1 and 252 sessions")
+    schedule = _quarterly_schedule(start,end,cfg.rebalance_months,cfg.rebalance_weeks)
+    cfg.benchmark = {"INTTECHA":"AB_INTL_TECH", "LU0060230025":"AB_INTL_TECH"}.get(cfg.benchmark.upper(),cfg.benchmark.upper())
+    warnings=[];benchmark_errors={}
+    # Fetch the optional fund before the expensive simulation and retain a clear
+    # error alongside successful results if its provider is unavailable.
+    try:
+        ab_close=load_ab_intl_tech(start,end)
+        if ab_close.attrs.get("warning"):warnings.append(ab_close.attrs["warning"])
+    except ValueError as exc:
+        ab_close=None;benchmark_errors["AB International Technology"]=str(exc)
     # Extra history is required so a 2021 decision can train only on pre-2021 rows.
     history_start = start - pd.DateOffset(years=8)
     comparison_symbols = ["SPY", "QQQ", "FWD"]
@@ -312,18 +308,17 @@ def run_backtest(universe: Iterable[str], cfg: BacktestConfig, progress=None):
     all_symbols = list(dict.fromkeys(universe + comparison_symbols + ([direct_primary] if direct_primary else [])))
     if progress:
         progress(.01, "Downloading historical prices")
-    data = _download(all_symbols, history_start, end)
+    data, download_errors = download_prices(all_symbols, history_start, end, _download, progress)
     if "SPY" not in data:
-        raise ValueError("SPY could not be downloaded for the trading calendar")
+        raise ValueError("Yahoo SPY history is unavailable for the trading calendar. The provider may be rate-limiting requests; retry later. Completed downloads are cached.")
     benchmark = data["SPY"]
-    stock_data = {s: data[s] for s in universe if s in data}
+    stock_data = data.subset(universe)
     if len(stock_data) < cfg.holdings:
         raise ValueError(f"Only {len(stock_data)} symbols downloaded successfully; need at least {cfg.holdings}.")
 
     calendar = benchmark.loc[start:end].index
     if len(calendar) < 2:
         raise ValueError("No benchmark trading sessions in the requested period")
-    schedule = _quarterly_schedule(start, end, cfg.rebalance_months)
     trades = []
     holdings_log = []
     shares = {}
@@ -345,10 +340,10 @@ def run_backtest(universe: Iterable[str], cfg: BacktestConfig, progress=None):
     for date in calendar:
         date = pd.Timestamp(date)
         if date in rebalance_map:
-            sig = _signal_date(calendar, date)
+            sig = _signal_date(benchmark.index, date)
             if sig is not None:
-                base = .05 + .88 * completed_rebalances / total_rebalances
-                span = .88 / total_rebalances
+                base = .18 + .75 * completed_rebalances / total_rebalances
+                span = .75 / total_rebalances
                 if progress:
                     progress(base, f"Rebalance {completed_rebalances + 1}/{total_rebalances} · technical screen")
                 ranking = rank_universe(
@@ -358,6 +353,13 @@ def run_backtest(universe: Iterable[str], cfg: BacktestConfig, progress=None):
                 )
                 if not ranking.empty:
                     chosen = allocate(ranking, min(cfg.holdings, len(ranking)), cfg.profile)
+                    if len(chosen)<cfg.holdings:
+                        warnings.append(f"{date.date()}: only {len(chosen)} stocks passed the forecast/history rules (requested {cfg.holdings}).")
+                    # Validate every execution before mutating the account.
+                    for symbol in set(shares)|set(chosen.ticker):
+                        if date not in stock_data[symbol].index:
+                            raise ValueError(f"No execution bar for {symbol} on {date.date()}; refusing to drop a holding or invent a fill.")
+                        _execution_price(stock_data[symbol],date)
                     # Liquidate everything at next-session open.
                     for s, qty in list(shares.items()):
                         frame = stock_data[s]
@@ -371,8 +373,8 @@ def run_backtest(universe: Iterable[str], cfg: BacktestConfig, progress=None):
                         trades.append({"date": date, "signal_date": sig, "ticker": s, "side": "SELL", "shares": qty, "price": px, "fee": fee})
                     shares = {}
 
-                    portfolio_value = cash
-                    # Buy target basket.
+                    portfolio_value = cash / (1 + cfg.transaction_cost_bps / 10_000)
+                    # Reserve buy-side costs before sizing every position.
                     for row in chosen.itertuples(index=False):
                         s = row.ticker
                         frame = stock_data[s]
@@ -407,14 +409,19 @@ def run_backtest(universe: Iterable[str], cfg: BacktestConfig, progress=None):
                             "score": row.score,
                             "technical_score": row.technical_score,
                             "forecast_return": row.forecast_return,
+                            "forecast_kind": row.forecast_kind,
+                            "ml_evidence_weight": row.ml_evidence_weight,
                             "target_weight": row.target_weight,
                             "execution_price": px,
                             "shares": qty,
                         })
 
+                else:
+                    warnings.append(f"{date.date()}: no eligible stocks; existing holdings/cash retained.")
+
             completed_rebalances += 1
             if progress:
-                progress(.05 + .88 * completed_rebalances / total_rebalances,
+                progress(.18 + .75 * completed_rebalances / total_rebalances,
                          f"Completed rebalance {completed_rebalances}/{total_rebalances}")
 
         value = cash
@@ -444,12 +451,6 @@ def run_backtest(universe: Iterable[str], cfg: BacktestConfig, progress=None):
         if stats:
             comparison_meta.append(stats)
 
-    # Prefer the fund's own NAV history. Yahoo's XAY5 venue aliases are
-    # inconsistent, so keep them only as a fallback.
-    ab_close = load_ab_intl_tech(history_start, end)
-    ab_source = "Morningstar F0GBR04I8U"
-    if ab_close is None or ab_close.empty:
-        ab_close, ab_source = _download_ab_intl_tech_usd(history_start, end)
     if ab_close is not None and not ab_close.empty:
         ab_series = _anchor_comparison(ab_close, equity)
         if ab_series is not None:
@@ -457,17 +458,16 @@ def run_backtest(universe: Iterable[str], cfg: BacktestConfig, progress=None):
             comparisons[label] = ab_series
             stats = _comparison_stats(label, ab_series, equity)
             if stats:
-                stats["source_symbol"] = ab_source
+                stats["source_symbol"] = ab_close.attrs.get("source", "Official AB A USD NAV")
                 comparison_meta.append(stats)
+        else:benchmark_errors["AB International Technology"]="AB NAV does not overlap this backtest sufficiently."
 
     primary_label = COMPARISON_LABELS.get(cfg.benchmark, cfg.benchmark)
     if primary_label not in comparisons:
-        raise ValueError(
-            f"Primary benchmark {primary_label} is unavailable for this run. "
-            "Choose another benchmark or retry if the data provider was temporarily unavailable."
-        )
-
-    equity["benchmark"] = comparisons[primary_label]
+        benchmark_errors.setdefault(primary_label,"Benchmark history is unavailable for the requested period.")
+        warnings.append(f"Primary benchmark {primary_label} is unavailable; the portfolio results are still shown.")
+        equity["benchmark"]=np.nan
+    else:equity["benchmark"]=comparisons[primary_label]
     equity["portfolio_return"] = equity.portfolio / cfg.starting_cash - 1
     primary_valid = equity["benchmark"].dropna()
     equity["benchmark_return"] = np.nan
@@ -477,22 +477,21 @@ def run_backtest(universe: Iterable[str], cfg: BacktestConfig, progress=None):
             equity.loc[first_primary:, "benchmark"] / float(primary_valid.iloc[0]) - 1
         )
 
-    daily = equity.portfolio.pct_change().dropna()
-    ann_return = (equity.portfolio.iloc[-1] / equity.portfolio.iloc[0]) ** (252 / max(len(daily), 1)) - 1
+    daily = equity.portfolio.pct_change()
+    daily.iloc[0] = equity.portfolio.iloc[0] / cfg.starting_cash - 1
+    daily = daily.dropna()
+    ann_return = (equity.portfolio.iloc[-1] / cfg.starting_cash) ** (365.25 / max((equity.index[-1]-start).days,1)) - 1
     ann_vol = daily.std() * np.sqrt(252) if len(daily) else np.nan
-    sharpe = ann_return / ann_vol if ann_vol and ann_vol > 0 else np.nan
-    dd = equity.portfolio / equity.portfolio.cummax() - 1
+    sharpe = daily.mean() * 252 / ann_vol if ann_vol and ann_vol > 0 else np.nan
+    dd = equity.portfolio / equity.portfolio.cummax().clip(lower=cfg.starting_cash) - 1
 
     summary = {
         "start_value": cfg.starting_cash,
         "end_value": float(equity.portfolio.iloc[-1]),
         "total_return": float(equity.portfolio.iloc[-1] / cfg.starting_cash - 1),
-        "benchmark_end": float(equity.benchmark.dropna().iloc[-1]),
-        "benchmark_return": float(equity.benchmark.dropna().iloc[-1] / equity.benchmark.dropna().iloc[0] - 1),
-        "alpha_vs_benchmark": float(
-            equity.portfolio.loc[equity.benchmark.dropna().index[-1]] / equity.portfolio.loc[equity.benchmark.dropna().index[0]]
-            - equity.benchmark.dropna().iloc[-1] / equity.benchmark.dropna().iloc[0]
-        ),
+        "benchmark_end": float(primary_valid.iloc[-1]) if len(primary_valid)>1 else np.nan,
+        "benchmark_return": float(primary_valid.iloc[-1]/primary_valid.iloc[0]-1) if len(primary_valid)>1 else np.nan,
+        "alpha_vs_benchmark": float(equity.portfolio.loc[primary_valid.index[-1]] / equity.portfolio.loc[primary_valid.index[0]] - primary_valid.iloc[-1]/primary_valid.iloc[0]) if len(primary_valid)>1 else np.nan,
         "annualized_return": float(ann_return),
         "annualized_volatility": float(ann_vol),
         "sharpe_no_rf": float(sharpe) if np.isfinite(sharpe) else np.nan,
@@ -509,4 +508,9 @@ def run_backtest(universe: Iterable[str], cfg: BacktestConfig, progress=None):
         "comparison_stats": pd.DataFrame(comparison_meta),
         "holdings": pd.DataFrame(holdings_log),
         "trades": pd.DataFrame(trades),
+        "warnings": warnings,
+        "download_errors": download_errors,
+        "benchmark_errors": benchmark_errors,
+        "universe_requested": len(universe),
+        "universe_downloaded": len(stock_data),
     }

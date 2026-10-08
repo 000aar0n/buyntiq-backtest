@@ -1,98 +1,64 @@
-from __future__ import annotations
-
-import json
+"""Official daily USD NAV for AB International Technology Portfolio A USD."""
 from datetime import date
-from urllib.parse import urlencode
+import json
+from pathlib import Path
+import time
 from urllib.request import Request, urlopen
+import uuid
 
+import numpy as np
 import pandas as pd
+from price_store import CACHE
+
+FUND_NAME = 'AB International Technology'
+ISIN = 'LU0060230025'
+OFFICIAL_URL = ('https://webapi.alliancebernstein.com/v2/funds/americas/en/investor/'
+                + ISIN + '/historical-navs?freq=daily')
+SOURCE = 'AllianceBernstein official A USD NAV (LU0060230025 / INTTECHA)'
 
 
-MORNINGSTAR_SECID = "F0GBR04I8U"
-FUND_NAME = "AB International Technology"
-PORTAL_TOKEN = "t92wz0sj7c"
-
-BASE_URLS = [
-    "https://tools.morningstar.co.uk/api/rest.svc/timeseries_price/" + PORTAL_TOKEN,
-    "https://tools.morningstar.es/api/rest.svc/timeseries_price/" + PORTAL_TOKEN,
-]
-
-
-def _extract_history(payload: dict) -> pd.Series:
-    timeseries = payload.get("TimeSeries") or {}
-    securities = timeseries.get("Security") or []
-    if isinstance(securities, dict):
-        securities = [securities]
-
-    rows = []
-    for security in securities:
-        history = security.get("HistoryDetail") or []
-        if isinstance(history, dict):
-            history = [history]
-        for item in history:
-            value = item.get("Value")
-            if isinstance(value, list):
-                value = value[0] if value else None
-            if isinstance(value, dict):
-                value = value.get("value", value.get("Value"))
-            try:
-                px = float(str(value).replace(",", ""))
-                dt = pd.Timestamp(item.get("EndDate")).normalize()
-            except Exception:
-                continue
-            if px > 0:
-                rows.append((dt, px))
-
-    if not rows:
-        return pd.Series(dtype=float, name=FUND_NAME)
-
-    frame = (
-        pd.DataFrame(rows, columns=["date", "close"])
-        .drop_duplicates("date", keep="last")
-        .sort_values("date")
-    )
-    return pd.Series(
-        frame["close"].to_numpy(),
-        index=pd.DatetimeIndex(frame["date"]),
-        name=FUND_NAME,
-    )
+def _extract_history(payload):
+    rows=payload.get('navs',[])
+    if not isinstance(rows,list) or not rows:
+        raise ValueError('AB returned no NAV observations')
+    frame=pd.DataFrame(rows)
+    if not {'date','price'}.issubset(frame):raise ValueError('Unrecognized AB NAV response')
+    dates=pd.to_datetime(frame.date,errors='coerce',utc=True,format='mixed').dt.tz_localize(None).dt.normalize()
+    values=pd.to_numeric(frame.price.astype(str).str.replace(',','',regex=False),errors='coerce')
+    series=pd.Series(values.to_numpy(),index=pd.DatetimeIndex(dates),name=FUND_NAME)
+    series=series[series.index.notna() & np.isfinite(series) & (series>0)]
+    series=series[~series.index.duplicated(keep='last')].sort_index()
+    if series.empty:raise ValueError('AB returned no valid NAV values')
+    series.attrs.update(source=SOURCE,currency='USD',isin=ISIN,source_url=OFFICIAL_URL)
+    return series
 
 
-def load_ab_intl_tech(start, end=None) -> pd.Series:
-    """Load daily USD NAV for AB International Technology A USD.
-
-    ISIN: LU0060230025
-    Morningstar security ID: F0GBR04I8U
-    """
-    start = pd.Timestamp(start).normalize()
-    end = pd.Timestamp(end or date.today()).normalize()
-
-    params = {
-        "currencyId": "USD",
-        "idtype": "Morningstar",
-        "frequency": "daily",
-        "outputType": "JSON",
-        "startDate": start.strftime("%Y-%m-%d"),
-        "endDate": end.strftime("%Y-%m-%d"),
-        "id": MORNINGSTAR_SECID + "]2]0]FOGBR$$ALL",
-        "applyTrackRecordExtension": "true",
-    }
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "application/json,text/plain,*/*",
-    }
-
-    for base in BASE_URLS:
+def load_ab_intl_tech(start,end=None):
+    start=pd.Timestamp(start).normalize();end=pd.Timestamp(end or date.today()).normalize()
+    path=CACHE/'ab-LU0060230025-nav.json'
+    payload=None;cached=None
+    if path.exists():
         try:
-            request = Request(base + "?" + urlencode(params), headers=headers)
-            with urlopen(request, timeout=20) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-            series = _extract_history(payload)
-            if not series.empty:
-                return series.loc[
-                    (series.index >= start) & (series.index <= end)
-                ]
-        except Exception:
-            continue
-
-    return pd.Series(dtype=float, name=FUND_NAME)
+            cached=json.loads(path.read_text())
+            _extract_history(cached)
+            if time.time()-path.stat().st_mtime<21600:payload=cached
+        except (ValueError,OSError,KeyError):cached=None
+    warning=None
+    if payload is None:
+        try:
+            request=Request(OFFICIAL_URL,headers={'User-Agent':'BuyntiqBacktest/1.0','Accept':'application/json'})
+            with urlopen(request,timeout=30) as response:payload=json.load(response)
+            _extract_history(payload)
+            CACHE.mkdir(parents=True,exist_ok=True)
+            temp=path.with_name(path.name+'.'+uuid.uuid4().hex)
+            temp.write_text(json.dumps(payload));temp.replace(path)
+        except Exception as exc:
+            if cached is None:
+                raise ValueError(f'AB official NAV could not be loaded ({type(exc).__name__}). Please retry.') from exc
+            payload=cached
+            warning='AB provider unavailable; showing the saved NAV history through its last reported date.'
+    series=_extract_history(payload)
+    series=series.loc[(series.index>=start)&(series.index<=end)]
+    if len(series)<2:raise ValueError('AB A USD NAV has fewer than two observations in this date range.')
+    if warning:series.attrs['warning']=warning
+    return series
