@@ -13,7 +13,8 @@ EXCLUDED = re.compile(
     r"\b(?:preferred (?:stock|shares|securities)|preference shares|ETF|ETN)\b"
     r"|\b(?:warrants?|rights?|units?|debentures?|notes|bonds)\b(?!.*\b(?:common stock|ordinary shares)\b)"
     r"|\bunits?,?\s+(?:each|consisting)\b"
-    r"|depositary shares.*(?:series|interest)", re.I
+    r"|depositary shares.*(?:series|interest)"
+    r"|\b(?:fund|closed[ -]end|portfolio|income trust|(?<!real estate )investment trust)\b", re.I
 )
 
 

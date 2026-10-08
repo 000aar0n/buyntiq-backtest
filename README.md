@@ -9,7 +9,7 @@ A standalone historical simulator using Buyntiq-style technical scoring, Ridge/E
 - **Rebuild portfolio:** weekly, every 1/2/3/6 months, or annually. Model inputs and forecasts are refreshed at each historical rebalance.
 - **Forecast horizon:** match the rebalance interval or separately choose 1m/3m/6m/1y. Matching weekly uses five trading sessions.
 - **Holdings:** 3–50, with Conservative/Balanced/Aggressive weighting, optional positive forecasts, fractional/whole shares, and trading costs.
-- **Model mode:** Fast uses smaller models and one chronological validation block; Full uses three folds. Both are historical approximations to the live app, not an exact replay of every production feature.
+- **Model mode:** Fast uses smaller models and one selection block; Full uses three selection folds. Both now gate ML influence on a separate chronological holdout with a full-horizon purge. Baselines use only each training window’s matured outcomes. Both are historical approximations to the live app, not an exact replay of every production feature.
 
 Results remain visible after settings change or CSV downloads. The saved run is labeled with its actual settings. Run again to apply changes. Export holdings, trades, daily equity, benchmark comparisons/curves, settings, and unavailable histories.
 
@@ -66,3 +66,11 @@ python -m pytest -q
 ```
 
 Tests cover first-session investing, monthly/weekly schedules, fee accounting, missing execution data, AB NAV parsing and overlap, listing filters, batched caching, and persistent Streamlit results. Fixtures are isolated test inputs; the application does not generate synthetic market data.
+
+## October 2026 validation audit
+
+Fixed: the stock directory filter admitted named closed-end funds (including DHY and FTHY); it now excludes fund/portfolio/investment-trust security names while preserving ordinary REITs. This is name-based classification, not a complete security master: unusually named vehicles and historical SPAC/predecessor identities remain a limitation.
+
+Fixed: validation baselines previously used outcomes later than the validation training cutoff. Full mode reserved but never evaluated its holdout. Ensemble weights are now selected before the holdout, and ML influence is gated by holdout performance against a training-only baseline. Overlapping horizon labels mean holdout rows are not independent trials.
+
+The supplied losing run had 245 of 315 position rows with zero ML influence. That reflects baseline/historical-median fallbacks; it is not proof of an execution defect. Selection is still technical pre-screening followed by forecasts for finalists, not ML ranking of every listing. Low liquidity, sector exposure, current-membership survivorship bias, and full liquidation/repurchase costs can materially affect results. These fixes do not establish that the previous loss was caused entirely by bugs or promise positive returns. Previous exports must be rerun to reflect the fixes.

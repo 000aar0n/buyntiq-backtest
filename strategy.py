@@ -208,11 +208,11 @@ def forecast_return(prices: pd.DataFrame, horizon: int = 63, mode: str = "fast")
     """Point-in-time Buyntiq-style stock forecast.
 
     fast:
-        One chronological validation block + smaller versions of the same three
+        One selection block plus a separate purged holdout + smaller versions of the same three
         production model families. Designed for repeated quarterly backtests.
 
     full:
-        Three time-series validation folds and the larger production-style
+        Three time-series selection folds, a separate purged holdout and larger
         model settings. Much slower on throttled CPUs.
     """
     if mode not in ("fast", "full"):
@@ -245,35 +245,29 @@ def forecast_return(prices: pd.DataFrame, horizon: int = 63, mode: str = "fast")
     actual_parts = []
     pred_parts = {name: [] for name in names}
 
+    # Keep model selection and evidence evaluation separate. Purge a full
+    # horizon so no training label reaches the next evaluation period.
+    holdout_n = min(252, max(horizon, 84 if mode == "fast" else 126))
+    holdout_start = len(x) - holdout_n
+    dev_end = holdout_start - horizon
+    validation_size = min(84, max(42, horizon))
+    if dev_end - horizon - validation_size < 250:
+        baseline_log = float(y.tail(252).median())
+        return {"available": True, "predicted_return": float(np.expm1(baseline_log)),
+                "evidence_weight": 0.0, "kind": "Historical median"}
     if mode == "fast":
-        # One non-overlapping chronological validation block. Training labels
-        # end at least one forecast horizon before validation starts.
-        validation_size = min(84, max(42, horizon))
-        val_start = len(x) - validation_size
-        train_end = val_start - horizon
-        if train_end < 300:
-            return {"available": False, "predicted_return": np.nan, "evidence_weight": 0.0, "kind": "Unavailable"}
-        train = np.arange(train_end)
-        test = np.arange(val_start, len(x))
+        val_start = dev_end - validation_size
+        splits = [(np.arange(val_start - horizon), np.arange(val_start, dev_end))]
+    else:
+        test_size = min(max(84, horizon), (dev_end - horizon - 250) // 3)
+        splits = TimeSeriesSplit(n_splits=3, test_size=test_size, gap=horizon).split(x.iloc[:dev_end])
+    baseline_parts = []
+    for train, test in splits:
         member = _fit_member_predictions(x, y, sc, train, x.iloc[test], sc.iloc[test].to_numpy(), mode)
         actual_parts.append(y.iloc[test].to_numpy())
+        baseline_parts.append(np.full(len(test), float(y.iloc[train].tail(252).median())))
         for name in names:
             pred_parts[name].append(member[name])
-    else:
-        holdout_n = min(252, max(horizon, 126))
-        dev_end = len(x) - holdout_n - horizon
-        if dev_end < 450:
-            return {"available": False, "predicted_return": np.nan, "evidence_weight": 0.0, "kind": "Unavailable"}
-        dev_x = x.iloc[:dev_end]
-        test_size = min(max(84, horizon), max(42, (len(dev_x) - horizon - 250) // 3))
-        splitter = TimeSeriesSplit(n_splits=3, test_size=test_size, gap=horizon)
-        for train, test in splitter.split(dev_x):
-            member = _fit_member_predictions(
-                x, y, sc, train, x.iloc[test], sc.iloc[test].to_numpy(), mode
-            )
-            actual_parts.append(y.iloc[test].to_numpy())
-            for name in names:
-                pred_parts[name].append(member[name])
 
     actual = np.concatenate(actual_parts)
     predictions = {name: np.concatenate(pred_parts[name]) for name in names}
@@ -285,11 +279,21 @@ def forecast_return(prices: pd.DataFrame, horizon: int = 63, mode: str = "fast")
     weights = {k: .5 / len(names) + .5 * inv[k] / sum(inv.values()) for k in names}
     blended = sum(weights[k] * predictions[k] for k in names)
 
-    baseline_log = float(y.iloc[:max(1, len(y) - horizon)].tail(252).median())
-    baseline = np.repeat(baseline_log, len(actual))
-    blend_mae = float(np.mean(np.abs(np.expm1(actual) - np.expm1(blended))))
-    base_mae = float(np.mean(np.abs(np.expm1(actual) - np.expm1(baseline))))
+    dev_baseline = np.concatenate(baseline_parts)
+    dev_base_mae = float(np.mean(np.abs(np.expm1(actual) - np.expm1(dev_baseline))))
+    dev_blend_mae = float(np.mean(np.abs(np.expm1(actual) - np.expm1(blended))))
+
+    # Weights are now frozen. The untouched holdout alone gates ML influence.
+    holdout_train = np.arange(dev_end)
+    holdout = np.arange(holdout_start, len(x))
+    held = _fit_member_predictions(x, y, sc, holdout_train, x.iloc[holdout], sc.iloc[holdout].to_numpy(), mode)
+    held_blend = sum(weights[k] * held[k] for k in names)
+    held_baseline = float(y.iloc[holdout_train].tail(252).median())
+    held_actual = np.expm1(y.iloc[holdout].to_numpy())
+    blend_mae = float(np.mean(np.abs(held_actual - np.expm1(held_blend))))
+    base_mae = float(np.mean(np.abs(held_actual - np.expm1(held_baseline))))
     alpha = 1.0 if blend_mae < 0.97 * base_mae else 0.0
+    baseline_log = float(y.tail(252).median())
 
     # joined already contains only matured targets, so this final fit remains causal.
     train = np.arange(len(x))
@@ -310,7 +314,11 @@ def forecast_return(prices: pd.DataFrame, horizon: int = 63, mode: str = "fast")
         "evidence_weight": float(np.clip(evidence, 0, .8)),
         "kind": ("Fast validated ensemble" if mode == "fast" else "Validated ensemble") if alpha else "Baseline fallback",
         "ml_blend": alpha,
-        "dev_skill": skill,
+        "dev_skill": 0.0 if dev_base_mae <= 1e-9 else 1 - dev_blend_mae / dev_base_mae,
+        "holdout_skill": skill,
+        "holdout_mae": blend_mae,
+        "holdout_baseline_mae": base_mae,
+        "holdout_rows": len(holdout),
         "mode": mode,
     }
 
