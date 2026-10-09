@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from collections import Counter
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -10,7 +11,8 @@ import pandas as pd
 import yfinance as yf
 
 from ab_benchmark import load_ab_intl_tech
-from price_store import download_prices
+from price_store import download_prices, prepare_yahoo_history
+from eligibility import HistoricalSizeStore, price_liquidity_check
 from strategy import technical_analysis, forecast_return, combined_score, allocate
 from threadpoolctl import threadpool_limits
 
@@ -66,15 +68,18 @@ class BacktestConfig:
     whole_shares: bool = False
     model_mode: str = "fast"
     finalists: int = 18
+    min_market_cap: float = 2_000_000_000.0
+    min_price: float = 5.0
+    min_dollar_volume: float = 10_000_000.0
 
 
 def _download(symbols: List[str], start: pd.Timestamp, end: pd.Timestamp) -> Dict[str, pd.DataFrame]:
     raw = yf.download(
         symbols,
         start=start.strftime("%Y-%m-%d"),
-        end=(end + pd.Timedelta(days=2)).strftime("%Y-%m-%d"),
-        auto_adjust=True,
-        actions=False,
+        end=(max(end, pd.Timestamp.now(tz="America/New_York").tz_localize(None).normalize()) + pd.Timedelta(days=2)).strftime("%Y-%m-%d"),
+        auto_adjust=False,
+        actions=True,
         group_by="column",
         threads=4,
         timeout=15,
@@ -97,11 +102,11 @@ def _download(symbols: List[str], start: pd.Timestamp, end: pd.Timestamp) -> Dic
                 except Exception:
                     pass
             if frame is not None and "Close" in frame and frame.Close.notna().any():
-                out[s] = frame.dropna(subset=["Close"]).copy()
+                out[s] = prepare_yahoo_history(frame)
     else:
         if len(symbols) == 1:
             s = symbols[0]
-            out[s] = raw.dropna(subset=["Close"]).copy()
+            out[s] = prepare_yahoo_history(raw)
     return out
 
 
@@ -207,6 +212,11 @@ def rank_universe(
     progress=None,
     progress_base: float = 0.0,
     progress_span: float = 0.0,
+    min_market_cap: float = 0.0,
+    min_price: float = 0.0,
+    min_dollar_volume: float = 0.0,
+    size_store=None,
+    exclusions=None,
 ) -> pd.DataFrame:
     """Fast two-stage screen: technical score first, ML only for finalists.
 
@@ -214,17 +224,25 @@ def rank_universe(
     CPU on deep ML for names that cannot make the final portfolio.
     """
     technical_rows = []
+    excluded = exclusions if exclusions is not None else Counter()
+    size_store = size_store or (HistoricalSizeStore() if min_market_cap > 0 else None)
     for screened, (symbol, frame) in enumerate(price_data.items(), 1):
         if progress and (screened % 100 == 0 or screened == len(price_data)):
             progress(progress_base, f"Technical screen · {screened:,}/{len(price_data):,} stocks")
         hist = frame.loc[:as_of].copy()
         if len(hist) < 260 or hist.index[-1] != as_of:
+            excluded['Insufficient or stale price history'] += 1
+            continue
+        eligibility, reason = price_liquidity_check(hist, min_price, min_dollar_volume)
+        if reason:
+            excluded[reason] += 1
             continue
         tech = technical_analysis(hist)
         if not tech:
             continue
         technical_rows.append({
             "ticker": symbol,
+            **eligibility,
             "technical_score": tech["technical_score"],
             "annualized_volatility": tech["annualized_volatility"],
             "price_asof": tech["price"],
@@ -248,6 +266,16 @@ def rank_universe(
         batch = screen.iloc[next_idx:stop]
         for row in batch.itertuples(index=False):
             symbol = row.ticker
+            size_info = {}
+            if min_market_cap > 0:
+                if progress and progress_span:
+                    progress(progress_base + progress_span * min(.99, next_idx / max(target_finalists, next_idx + 1)),
+                             f"Checking historical size · {symbol} · {next_idx + 1} candidates checked")
+                size_info, reason = size_store.estimate(symbol, price_data[symbol].loc[:as_of], as_of)
+                if reason or not size_info or size_info['estimated_market_cap'] < min_market_cap:
+                    excluded[reason or 'Below minimum estimated market cap'] += 1
+                    next_idx += 1
+                    continue
             with threadpool_limits(limits=1):
                 forecast = forecast_return(price_data[symbol].loc[:as_of], horizon=horizon, mode=model_mode)
             if progress and progress_span:
@@ -256,11 +284,15 @@ def rank_universe(
                          f"ML candidates checked · {next_idx + 1} · eligible so far · {len(analyzed)}")
             pred = float(forecast.get("predicted_return", np.nan)) if forecast else np.nan
             if not np.isfinite(pred) or not forecast.get("available") or (positive_only and pred <= 0):
+                excluded["Unavailable or non-positive forecast"] += 1
                 next_idx += 1
                 continue
             score, _ = combined_score(row.technical_score, forecast)
             analyzed.append({
                 "ticker": symbol,
+                **size_info,
+                "historical_price": row.historical_price,
+                "median_daily_dollar_volume": row.median_daily_dollar_volume,
                 "score": score,
                 "technical_score": row.technical_score,
                 "forecast_return": pred,
@@ -294,6 +326,12 @@ def run_backtest(universe: Iterable[str], cfg: BacktestConfig, progress=None):
     if not np.isfinite(cfg.starting_cash) or cfg.starting_cash <= 0:raise ValueError("Starting cash must be positive")
     if not np.isfinite(cfg.transaction_cost_bps) or not 0 <= cfg.transaction_cost_bps <= 100:raise ValueError("Trading costs must be between 0 and 100 bps")
     if not isinstance(cfg.horizon,int) or not 1 <= cfg.horizon <= 252:raise ValueError("Forecast horizon must be between 1 and 252 sessions")
+    for name in ('min_market_cap', 'min_price', 'min_dollar_volume'):
+        value = getattr(cfg, name)
+        if not np.isfinite(value) or value < 0:
+            raise ValueError(f'{name} must be a finite, nonnegative number')
+    if cfg.min_market_cap > 0 and start < pd.Timestamp('2009-01-01'):
+        raise ValueError('The SEC size filter lacks pre-2009 filing coverage. Choose a later start or explicitly set minimum market cap to 0.')
     schedule = _quarterly_schedule(start,end,cfg.rebalance_months,cfg.rebalance_weeks)
     cfg.benchmark = {"INTTECHA":"AB_INTL_TECH", "LU0060230025":"AB_INTL_TECH"}.get(cfg.benchmark.upper(),cfg.benchmark.upper())
     warnings=[];benchmark_errors={}
@@ -324,6 +362,8 @@ def run_backtest(universe: Iterable[str], cfg: BacktestConfig, progress=None):
         raise ValueError("No benchmark trading sessions in the requested period")
     trades = []
     holdings_log = []
+    eligibility_log = []
+    size_store = HistoricalSizeStore() if cfg.min_market_cap > 0 else None
     shares = {}
     cash = float(cfg.starting_cash)
     costs_total = 0.0
@@ -349,11 +389,17 @@ def run_backtest(universe: Iterable[str], cfg: BacktestConfig, progress=None):
                 span = .75 / total_rebalances
                 if progress:
                     progress(base, f"Rebalance {completed_rebalances + 1}/{total_rebalances} · technical screen")
+                exclusions = Counter()
                 ranking = rank_universe(
                     stock_data, sig, cfg.horizon, cfg.positive_forecast_only,
                     count=cfg.holdings, finalists=cfg.finalists, model_mode=cfg.model_mode,
                     progress=progress, progress_base=base, progress_span=span * .9,
+                    min_market_cap=cfg.min_market_cap, min_price=cfg.min_price,
+                    min_dollar_volume=cfg.min_dollar_volume, size_store=size_store,
+                    exclusions=exclusions,
                 )
+                eligibility_log.extend({'signal_date': sig, 'reason': reason, 'count': n}
+                                       for reason, n in exclusions.items())
                 if not ranking.empty:
                     chosen = allocate(ranking, min(cfg.holdings, len(ranking)), cfg.profile)
                     if len(chosen)<cfg.holdings:
@@ -409,6 +455,12 @@ def run_backtest(universe: Iterable[str], cfg: BacktestConfig, progress=None):
                             "rebalance_date": date,
                             "signal_date": sig,
                             "ticker": s,
+                            "estimated_market_cap": getattr(row, 'estimated_market_cap', np.nan),
+                            "historical_price": getattr(row, 'historical_price', np.nan),
+                            "median_daily_dollar_volume": getattr(row, 'median_daily_dollar_volume', np.nan),
+                            "shares_report_date": getattr(row, 'shares_report_date', None),
+                            "shares_filed_date": getattr(row, 'shares_filed_date', None),
+                            "size_source": getattr(row, 'size_source', 'Size filter disabled'),
                             "score": row.score,
                             "technical_score": row.technical_score,
                             "forecast_return": row.forecast_return,
@@ -420,7 +472,19 @@ def run_backtest(universe: Iterable[str], cfg: BacktestConfig, progress=None):
                         })
 
                 else:
-                    warnings.append(f"{date.date()}: no eligible stocks; existing holdings/cash retained.")
+                    # Do not retain now-ineligible holdings when no replacement qualifies.
+                    for symbol, qty in list(shares.items()):
+                        frame = stock_data[symbol]
+                        if date not in frame.index:
+                            raise ValueError(f"No execution bar for {symbol} on {date.date()}; cannot close an ineligible holding.")
+                        px = _execution_price(frame, date)
+                        fee = qty * px * cfg.transaction_cost_bps / 10_000
+                        cash += qty * px - fee
+                        costs_total += fee
+                        trades.append({"date": date, "signal_date": sig, "ticker": symbol,
+                                       "side": "SELL", "shares": qty, "price": px, "fee": fee})
+                    shares = {}
+                    warnings.append(f"{date.date()}: no stocks passed eligibility/forecast rules; portfolio held in cash. See exclusion counts.")
 
             completed_rebalances += 1
             if progress:
@@ -510,6 +574,7 @@ def run_backtest(universe: Iterable[str], cfg: BacktestConfig, progress=None):
         "comparisons": comparisons,
         "comparison_stats": pd.DataFrame(comparison_meta),
         "holdings": pd.DataFrame(holdings_log),
+        "eligibility_exclusions": pd.DataFrame(eligibility_log, columns=["signal_date", "reason", "count"]),
         "trades": pd.DataFrame(trades),
         "warnings": warnings,
         "download_errors": download_errors,

@@ -8,6 +8,7 @@ import tempfile
 import time
 import uuid
 
+import numpy as np
 import pandas as pd
 
 CACHE = Path(os.environ.get('BUYNTIQ_BACKTEST_CACHE',Path(tempfile.gettempdir())/'buyntiq-backtest-cache-v1'))
@@ -31,11 +32,39 @@ class PriceStore(Mapping):
     def subset(self,symbols):return PriceStore({s:self.paths[s] for s in symbols if s in self.paths})
 
 
+def prepare_yahoo_history(frame):
+    """Preserve total-return OHLC; add price/volume in historical trading units.
+
+    Input is Yahoo auto_adjust=False with corporate actions THROUGH TODAY,
+    even for a backtest ending earlier. Future splits only undo Yahoo's unit
+    conversion; future returns never enter features or eligibility.
+    """
+    required = {'Open', 'High', 'Low', 'Close', 'Adj Close', 'Volume', 'Stock Splits'}
+    if not required.issubset(frame):
+        raise ValueError('Yahoo did not return prices and corporate actions needed for historical filters')
+    f = frame.copy().sort_index()
+    splits = pd.to_numeric(f['Stock Splits'], errors='coerce').fillna(0)
+    if not np.isfinite(splits).all() or (splits < 0).any():
+        raise ValueError('Invalid Yahoo stock-split history')
+    factors = splits.mask(splits == 0, 1)
+    # Exclude the event on this row: its closing price is already post-split.
+    future = factors.iloc[::-1].cumprod().iloc[::-1] / factors
+    f['Split Factor'] = future
+    f['As Traded Close'] = f.Close * future
+    # Yahoo Close and Volume share the same split basis; dividends are excluded.
+    f['Dollar Volume'] = f.Close * f.Volume
+    adjustment = f['Adj Close'] / f.Close
+    for col in ['Open', 'High', 'Low', 'Close']:
+        f[col] = f[col] * adjustment
+    f = f.dropna(subset=['Close'])
+    return f
+
+
 def download_prices(symbols,start,end,download,progress=None):
     CACHE.mkdir(parents=True,exist_ok=True)
     paths={};missing=[];failures={}
     for symbol in symbols:
-        key=hashlib.sha256(f'{symbol}|{start.date()}|{end.date()}|adjusted-v1'.encode()).hexdigest()
+        key=hashlib.sha256(f'{symbol}|{start.date()}|{end.date()}|historical-units-v2'.encode()).hexdigest()
         path=CACHE/f'{key}.csv.gz'
         if path.exists() and time.time()-path.stat().st_mtime<86400:
             try:
@@ -66,7 +95,7 @@ def download_prices(symbols,start,end,download,progress=None):
             frame.index=index.normalize()
             frame=frame[~frame.index.duplicated(keep='last')].sort_index().loc[:end]
             frame=frame.dropna(subset=['Close'])
-            frame=frame[frame.Close>0]
+            frame=frame[np.isfinite(frame.Close) & (frame.Close>0)]
             if frame.empty:
                 failures[symbol]='No positive closing prices in requested period'
                 continue

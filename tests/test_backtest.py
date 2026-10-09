@@ -10,7 +10,7 @@ from universe import parse_directory
 
 def frames():
     index=pd.bdate_range('2019-01-01','2022-05-10')
-    return {s:pd.DataFrame({'Open':100.,'High':100.,'Low':100.,'Close':100.,'Volume':10000.},index=index) for s in ['AAA','BBB','CCC','SPY','QQQ','FWD']}
+    return {s:pd.DataFrame({'Open':100.,'High':100.,'Low':100.,'Close':100.,'Volume':1000000.,'As Traded Close':100.,'Split Factor':1.,'Dollar Volume':100000000.},index=index) for s in ['AAA','BBB','CCC','SPY','QQQ','FWD']}
 
 
 @pytest.fixture
@@ -158,3 +158,8 @@ def test_streamlit_controls_and_saved_results(market,monkeypatch):
     assert len(app.metric)==4
     assert app.session_state['backtest_config']==before
     assert before['rebalance_months']==1 and before['horizon']==21
+    assert before['min_market_cap']==2e9 and before['min_price']==5 and before['min_dollar_volume']==1e7
+    next(x for x in app.number_input if x.label=='Minimum estimated market cap ($ billions)').set_value(5).run()
+    assert app.session_state['backtest_config']['min_market_cap']==2e9
+    next(x for x in app.button if x.label=='Run backtest').click().run()
+    assert not app.exception and app.session_state['backtest_config']['min_market_cap']==5e9
