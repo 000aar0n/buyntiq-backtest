@@ -10,11 +10,20 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
-from ab_benchmark import load_ab_intl_tech
-from price_store import download_prices, prepare_yahoo_history
-from eligibility import HistoricalSizeStore, price_liquidity_check
-from strategy import technical_analysis, forecast_return, combined_score, allocate
+if __package__:
+    from .ab_benchmark import load_ab_intl_tech
+    from .price_store import download_prices, prepare_yahoo_history
+    from .eligibility import HistoricalSizeStore, price_liquidity_check
+    from .strategy import technical_analysis, forecast_return, combined_score, allocate
+else:
+    from ab_benchmark import load_ab_intl_tech
+    from price_store import download_prices, prepare_yahoo_history
+    from eligibility import HistoricalSizeStore, price_liquidity_check
+    from strategy import technical_analysis, forecast_return, combined_score, allocate
 from threadpoolctl import threadpool_limits
+
+
+BACKTEST_API_VERSION = 2
 
 
 DEFAULT_UNIVERSE = [

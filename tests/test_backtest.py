@@ -141,6 +141,9 @@ def test_unknown_forecast_always_excluded(monkeypatch):
 def test_streamlit_controls_and_saved_results(market,monkeypatch):
     from streamlit.testing.v1 import AppTest
     import universe
+    import backend_loader
+    from types import SimpleNamespace
+    monkeypatch.setattr(backend_loader, 'load_backend', lambda: SimpleNamespace(engine=bt, universe=universe, build='ui-fixture'))
     monkeypatch.setattr(universe,'load_us_universe',lambda:pd.DataFrame({'ticker':['AAA','BBB','CCC']}))
     app=AppTest.from_file(Path(__file__).resolve().parents[1]/'app.py',default_timeout=30).run()
     assert not app.exception

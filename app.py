@@ -9,16 +9,25 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-from backtest import BacktestConfig, COMPARISON_LABELS, DEFAULT_UNIVERSE, run_backtest
-from universe import load_us_universe
+from backend_loader import load_backend
 
 st.set_page_config(page_title="Buyntiq Backtest", layout="wide")
+try:
+    backend = load_backend()
+except (RuntimeError, OSError) as exc:
+    st.error(f"Backtest startup could not finish: {exc}")
+    st.stop()
+BacktestConfig = backend.engine.BacktestConfig
+COMPARISON_LABELS = backend.engine.COMPARISON_LABELS
+DEFAULT_UNIVERSE = backend.engine.DEFAULT_UNIVERSE
+run_backtest = backend.engine.run_backtest
+load_us_universe = backend.universe.load_us_universe
 st.title("Buyntiq · Portfolio Backtest")
 st.caption("Choose your stock universe, historical period, and how often the portfolio is rebuilt.")
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def us_listings():
+def us_listings(engine_build):
     return load_us_universe()
 
 
@@ -87,7 +96,7 @@ if st.button("Run backtest", type="primary", use_container_width=True):
             raise ValueError("Start date must be before end date.")
         if scope == "Entire US stock universe":
             bar.progress(.01, text="Loading current US exchange listings")
-            listings = us_listings()
+            listings = us_listings(backend.build)
             symbols = listings.ticker.tolist()
         else:
             symbols = list(dict.fromkeys(x.strip().upper().replace(".", "-") for x in symbols_text.replace("\n", ",").split(",") if x.strip()))
@@ -99,6 +108,7 @@ if st.button("Run backtest", type="primary", use_container_width=True):
         result = run_backtest(symbols, cfg, progress=lambda f,m:bar.progress(min(max(float(f),0),1),text=m))
         st.session_state["backtest_result"] = result
         st.session_state["backtest_config"] = asdict(cfg)
+        st.session_state["backtest_build"] = backend.build
         st.session_state["backtest_scope"] = scope
         st.session_state["backtest_symbols"] = symbols
     except Exception as exc:
@@ -157,6 +167,7 @@ if result is not None:
     st.dataframe(result["holdings"],hide_index=True,use_container_width=True)
     st.download_button("Download holdings CSV",result["holdings"].to_csv(index=False),"buyntiq_backtest_holdings.csv","text/csv")
     with st.expander("Trade log and downloads"):
+        st.caption(f"Engine build: {st.session_state.get('backtest_build', 'older saved run')}")
         st.dataframe(result["trades"],hide_index=True,use_container_width=True)
         st.download_button("Download trades CSV",result["trades"].to_csv(index=False),"buyntiq_backtest_trades.csv","text/csv")
         st.download_button("Download daily equity CSV",result["equity"].to_csv(),"buyntiq_backtest_equity.csv","text/csv")

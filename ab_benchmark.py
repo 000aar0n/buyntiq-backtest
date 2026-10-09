@@ -8,7 +8,10 @@ import uuid
 
 import numpy as np
 import pandas as pd
-from price_store import CACHE
+if __package__:
+    from .price_store import CACHE
+else:
+    from price_store import CACHE
 
 FUND_NAME = 'AB International Technology'
 ISIN = 'LU0060230025'

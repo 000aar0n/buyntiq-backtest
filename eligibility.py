@@ -17,7 +17,10 @@ import uuid
 
 import numpy as np
 import pandas as pd
-import price_store
+if __package__:
+    from . import price_store
+else:
+    import price_store
 
 _LOCK = threading.Lock()
 _LAST_REQUEST = 0.0
