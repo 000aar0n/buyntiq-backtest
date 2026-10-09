@@ -214,7 +214,9 @@ def rank_universe(
     CPU on deep ML for names that cannot make the final portfolio.
     """
     technical_rows = []
-    for symbol, frame in price_data.items():
+    for screened, (symbol, frame) in enumerate(price_data.items(), 1):
+        if progress and (screened % 100 == 0 or screened == len(price_data)):
+            progress(progress_base, f"Technical screen · {screened:,}/{len(price_data):,} stocks")
         hist = frame.loc[:as_of].copy()
         if len(hist) < 260 or hist.index[-1] != as_of:
             continue
@@ -248,6 +250,10 @@ def rank_universe(
             symbol = row.ticker
             with threadpool_limits(limits=1):
                 forecast = forecast_return(price_data[symbol].loc[:as_of], horizon=horizon, mode=model_mode)
+            if progress and progress_span:
+                frac = min(.99, (next_idx + 1) / max(target_finalists, next_idx + 2))
+                progress(progress_base + progress_span * frac,
+                         f"ML candidates checked · {next_idx + 1} · eligible so far · {len(analyzed)}")
             pred = float(forecast.get("predicted_return", np.nan)) if forecast else np.nan
             if not np.isfinite(pred) or not forecast.get("available") or (positive_only and pred <= 0):
                 next_idx += 1
@@ -265,9 +271,6 @@ def rank_universe(
                 "rsi": row.rsi,
             })
             next_idx += 1
-            if progress and progress_span:
-                frac = min(1.0, next_idx / max(target_finalists, 1))
-                progress(progress_base + progress_span * frac, f"ML finalists · {next_idx}/{target_finalists}")
         if len(analyzed) >= count and next_idx >= target_finalists:
             break
         if next_idx >= len(screen):

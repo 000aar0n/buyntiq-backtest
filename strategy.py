@@ -295,14 +295,18 @@ def forecast_return(prices: pd.DataFrame, horizon: int = 63, mode: str = "fast")
     alpha = 1.0 if blend_mae < 0.97 * base_mae else 0.0
     baseline_log = float(y.tail(252).median())
 
-    # joined already contains only matured targets, so this final fit remains causal.
-    train = np.arange(len(x))
-    current_scale = max(float(f.volatility_63.iloc[-1]), .003) * np.sqrt(horizon)
-    latest = _fit_member_predictions(
-        x, y, sc, train, current, np.asarray([current_scale]), mode
-    )
-    raw_log = float(sum(weights[k] * latest[k][0] for k in names))
-    predicted_log = alpha * raw_log + (1 - alpha) * baseline_log
+    # Only refit when the independently tested ensemble will actually be used.
+    # A rejected ensemble contributes nothing to ranking or the forecast.
+    raw_log = np.nan
+    predicted_log = baseline_log
+    if alpha:
+        train = np.arange(len(x))
+        current_scale = max(float(f.volatility_63.iloc[-1]), .003) * np.sqrt(horizon)
+        latest = _fit_member_predictions(
+            x, y, sc, train, current, np.asarray([current_scale]), mode
+        )
+        raw_log = float(sum(weights[k] * latest[k][0] for k in names))
+        predicted_log = raw_log
 
     skill = 0.0 if base_mae <= 1e-9 else max(0.0, 1 - blend_mae / base_mae)
     evidence = min(skill, .25) / .25 * alpha * (.55 if mode == "fast" else .8)
