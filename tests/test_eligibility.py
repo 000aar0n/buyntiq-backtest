@@ -122,6 +122,15 @@ def test_provider_failure_never_disables_filter(monkeypatch):
         bt.rank_universe({'AAA':f},f.index[-1],63,True,1,1,'fast',min_market_cap=2e9,size_store=Failed())
 
 
+def test_sec_preflight_fails_before_expensive_downloads(monkeypatch):
+    class Failed:
+        def preflight(self):raise EligibilityProviderError('Historical share-count API blocked')
+    monkeypatch.setattr(bt, 'HistoricalSizeStore', Failed)
+    monkeypatch.setattr(bt, 'download_prices', lambda *a:pytest.fail('Must check provider first'))
+    with pytest.raises(EligibilityProviderError, match='blocked'):
+        bt.run_backtest(['AAA'], bt.BacktestConfig())
+
+
 def test_rebalance_rechecks_size_and_sells_to_cash_when_nobody_qualifies(tmp_path,monkeypatch):
     import price_store
     idx=pd.bdate_range('2022-01-01','2024-04-05')

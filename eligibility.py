@@ -54,7 +54,8 @@ def _cached_json(url):
     except HTTPError as exc:
         if exc.code == 404:
             return None
-        raise EligibilityProviderError(f'SEC size data unavailable (HTTP {exc.code}). The run stopped; no current-market-cap substitute was used.') from exc
+        endpoint = 'ticker directory' if 'company_tickers' in url else 'historical share-count API'
+        raise EligibilityProviderError(f'SEC {endpoint} unavailable (HTTP {exc.code}). The run stopped; no current-market-cap substitute was used.') from exc
     except (URLError, TimeoutError, ValueError, OSError) as exc:
         raise EligibilityProviderError('SEC size data could not be verified. Retry later; completed requests are cached.') from exc
     tmp = path.with_name(path.name + '.' + uuid.uuid4().hex)
@@ -96,10 +97,24 @@ class HistoricalSizeStore:
         self._mapping = None
         self._classes = defaultdict(set)
         self._concepts = {}
+        self.mapping_note = None
 
-    def estimate(self, symbol, history, as_of):
+    def _load_mapping(self):
         if self._mapping is None:
-            raw = self.fetch('https://www.sec.gov/files/company_tickers.json')
+            try:
+                raw = self.fetch('https://www.sec.gov/files/company_tickers.json')
+            except EligibilityProviderError:
+                # This is an identifier directory, never a substitute for
+                # historical fundamentals. Every share count is still dated.
+                snapshot = Path(__file__).resolve().parent / 'data' / 'sec_tickers.json'
+                if not snapshot.exists():
+                    raise
+                saved = json.loads(snapshot.read_text())
+                retrieved = pd.Timestamp(saved['retrieved_at'])
+                if pd.Timestamp.now(tz='UTC') - retrieved > pd.Timedelta(days=30):
+                    raise EligibilityProviderError('SEC ticker directory is blocked and the bundled directory is over 30 days old. Refresh the directory snapshot; the size filter remains enabled.')
+                raw = {s:{'ticker':s,'cik_str':cik} for s,cik in saved['tickers'].items()}
+                self.mapping_note = f"SEC live ticker directory unavailable; using official directory snapshot from {retrieved.date()}. Historical share counts still require dated filings."
             if not isinstance(raw, dict) or not raw:
                 raise EligibilityProviderError('SEC ticker mapping is unavailable; cannot apply the market-cap floor.')
             self._mapping = {}
@@ -112,6 +127,20 @@ class HistoricalSizeStore:
                 self._classes[cik].add(ticker)
             if not self._mapping:
                 raise EligibilityProviderError('SEC ticker mapping is invalid; cannot apply the market-cap floor.')
+
+    def preflight(self):
+        """Check required data before minutes of price downloads and model work."""
+        self._load_mapping()
+        cik = self._mapping.get('AAPL')
+        if cik is None:
+            raise EligibilityProviderError('SEC directory failed its identifier check.')
+        self._concepts[cik] = self.fetch(
+            f'https://data.sec.gov/api/xbrl/companyconcept/CIK{cik:010d}/dei/EntityCommonStockSharesOutstanding.json')
+        if not self._concepts[cik]:
+            raise EligibilityProviderError('SEC historical share-count API returned no data during its availability check.')
+
+    def estimate(self, symbol, history, as_of):
+        self._load_mapping()
         cik = self._mapping.get(symbol)
         if cik is None:
             return None, 'No SEC ticker mapping'

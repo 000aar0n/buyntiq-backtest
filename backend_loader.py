@@ -11,7 +11,7 @@ import sys
 import threading
 from types import ModuleType, SimpleNamespace
 
-_MODULES = ('price_store', 'eligibility', 'strategy', 'ab_benchmark', 'universe', 'backtest')
+_MODULES = ('price_store', 'eligibility', 'strategy', 'ranking', 'ab_benchmark', 'universe', 'backtest')
 _LOCK = threading.RLock()
 _REQUIRED_FILTERS = {'min_market_cap', 'min_price', 'min_dollar_volume'}
 

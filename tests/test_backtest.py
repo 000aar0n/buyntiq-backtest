@@ -15,7 +15,9 @@ def frames():
 
 @pytest.fixture
 def market(monkeypatch,tmp_path):
+    from types import SimpleNamespace
     data=frames()
+    monkeypatch.setattr(bt, 'HistoricalSizeStore', lambda: SimpleNamespace(preflight=lambda: None, mapping_note=None))
     monkeypatch.setattr(price_store,'CACHE',tmp_path)
     monkeypatch.setattr(bt,'_download',lambda symbols,start,end:{s:data[s].loc[start:end] for s in symbols if s in data})
     monkeypatch.setattr(bt,'load_ab_intl_tech',lambda start,end:pd.Series([100.,110.],index=pd.to_datetime(['2022-01-03','2022-04-29'])))

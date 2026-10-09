@@ -15,11 +15,13 @@ if __package__:
     from .price_store import download_prices, prepare_yahoo_history
     from .eligibility import HistoricalSizeStore, price_liquidity_check
     from .strategy import technical_analysis, forecast_return, combined_score, allocate
+    from .ranking import STRATEGIES, build_panel, predict_panel, eligible_ranking
 else:
     from ab_benchmark import load_ab_intl_tech
     from price_store import download_prices, prepare_yahoo_history
     from eligibility import HistoricalSizeStore, price_liquidity_check
     from strategy import technical_analysis, forecast_return, combined_score, allocate
+    from ranking import STRATEGIES, build_panel, predict_panel, eligible_ranking
 from threadpoolctl import threadpool_limits
 
 
@@ -80,6 +82,7 @@ class BacktestConfig:
     min_market_cap: float = 2_000_000_000.0
     min_price: float = 5.0
     min_dollar_volume: float = 10_000_000.0
+    ranking_strategy: str = "legacy"
 
 
 def _download(symbols: List[str], start: pd.Timestamp, end: pd.Timestamp) -> Dict[str, pd.DataFrame]:
@@ -335,6 +338,8 @@ def run_backtest(universe: Iterable[str], cfg: BacktestConfig, progress=None):
     if not np.isfinite(cfg.starting_cash) or cfg.starting_cash <= 0:raise ValueError("Starting cash must be positive")
     if not np.isfinite(cfg.transaction_cost_bps) or not 0 <= cfg.transaction_cost_bps <= 100:raise ValueError("Trading costs must be between 0 and 100 bps")
     if not isinstance(cfg.horizon,int) or not 1 <= cfg.horizon <= 252:raise ValueError("Forecast horizon must be between 1 and 252 sessions")
+    if cfg.ranking_strategy not in STRATEGIES:
+        raise ValueError("Unknown ranking strategy")
     for name in ('min_market_cap', 'min_price', 'min_dollar_volume'):
         value = getattr(cfg, name)
         if not np.isfinite(value) or value < 0:
@@ -344,6 +349,13 @@ def run_backtest(universe: Iterable[str], cfg: BacktestConfig, progress=None):
     schedule = _quarterly_schedule(start,end,cfg.rebalance_months,cfg.rebalance_weeks)
     cfg.benchmark = {"INTTECHA":"AB_INTL_TECH", "LU0060230025":"AB_INTL_TECH"}.get(cfg.benchmark.upper(),cfg.benchmark.upper())
     warnings=[];benchmark_errors={}
+    size_store = HistoricalSizeStore() if cfg.min_market_cap > 0 else None
+    if size_store is not None and hasattr(size_store, 'preflight'):
+        if progress:
+            progress(.005, 'Checking historical size-data availability')
+        size_store.preflight()
+        if size_store.mapping_note:
+            warnings.append(size_store.mapping_note)
     # Fetch the optional fund before the expensive simulation and retain a clear
     # error alongside successful results if its provider is unavailable.
     try:
@@ -372,7 +384,6 @@ def run_backtest(universe: Iterable[str], cfg: BacktestConfig, progress=None):
     trades = []
     holdings_log = []
     eligibility_log = []
-    size_store = HistoricalSizeStore() if cfg.min_market_cap > 0 else None
     shares = {}
     cash = float(cfg.starting_cash)
     costs_total = 0.0
@@ -388,25 +399,38 @@ def run_backtest(universe: Iterable[str], cfg: BacktestConfig, progress=None):
     rebalance_dates = sorted(rebalance_map)
     total_rebalances = max(len(rebalance_dates), 1)
     completed_rebalances = 0
+    model_diagnostics = []
+    panel = None
+    if cfg.ranking_strategy != "legacy":
+        signals = [_signal_date(benchmark.index, day) for day in rebalance_dates]
+        panel = build_panel(stock_data, benchmark.Close, [s for s in signals if s is not None],
+                            cfg.horizon, cfg.min_price, cfg.min_dollar_volume, progress)
 
     for date in calendar:
         date = pd.Timestamp(date)
         if date in rebalance_map:
             sig = _signal_date(benchmark.index, date)
             if sig is not None:
-                base = .18 + .75 * completed_rebalances / total_rebalances
-                span = .75 / total_rebalances
+                base = .28 + .65 * completed_rebalances / total_rebalances
+                span = .65 / total_rebalances
                 if progress:
-                    progress(base, f"Rebalance {completed_rebalances + 1}/{total_rebalances} · technical screen")
+                    progress(base, f"Rebalance {completed_rebalances + 1}/{total_rebalances} · ranking stocks")
                 exclusions = Counter()
-                ranking = rank_universe(
-                    stock_data, sig, cfg.horizon, cfg.positive_forecast_only,
-                    count=cfg.holdings, finalists=cfg.finalists, model_mode=cfg.model_mode,
-                    progress=progress, progress_base=base, progress_span=span * .9,
-                    min_market_cap=cfg.min_market_cap, min_price=cfg.min_price,
-                    min_dollar_volume=cfg.min_dollar_volume, size_store=size_store,
-                    exclusions=exclusions,
-                )
+                if panel is None:
+                    ranking = rank_universe(
+                        stock_data, sig, cfg.horizon, cfg.positive_forecast_only,
+                        count=cfg.holdings, finalists=cfg.finalists, model_mode=cfg.model_mode,
+                        progress=progress, progress_base=base, progress_span=span * .9,
+                        min_market_cap=cfg.min_market_cap, min_price=cfg.min_price,
+                        min_dollar_volume=cfg.min_dollar_volume, size_store=size_store,
+                        exclusions=exclusions,
+                    )
+                else:
+                    predictions, diagnostics = predict_panel(panel, sig, cfg.ranking_strategy)
+                    model_diagnostics.append(diagnostics)
+                    exclusions['Insufficient history or failed price/liquidity filter'] += len(stock_data) - len(panel[panel.date.eq(sig)])
+                    ranking = eligible_ranking(predictions, stock_data, sig, cfg, size_store, exclusions,
+                        (lambda message: progress(base + span * .8, message)) if progress else None)
                 eligibility_log.extend({'signal_date': sig, 'reason': reason, 'count': n}
                                        for reason, n in exclusions.items())
                 if not ranking.empty:
@@ -497,7 +521,7 @@ def run_backtest(universe: Iterable[str], cfg: BacktestConfig, progress=None):
 
             completed_rebalances += 1
             if progress:
-                progress(.18 + .75 * completed_rebalances / total_rebalances,
+                progress(.28 + .65 * completed_rebalances / total_rebalances,
                          f"Completed rebalance {completed_rebalances}/{total_rebalances}")
 
         value = cash
@@ -584,6 +608,7 @@ def run_backtest(universe: Iterable[str], cfg: BacktestConfig, progress=None):
         "comparison_stats": pd.DataFrame(comparison_meta),
         "holdings": pd.DataFrame(holdings_log),
         "eligibility_exclusions": pd.DataFrame(eligibility_log, columns=["signal_date", "reason", "count"]),
+        "model_diagnostics": pd.DataFrame(model_diagnostics),
         "trades": pd.DataFrame(trades),
         "warnings": warnings,
         "download_errors": download_errors,

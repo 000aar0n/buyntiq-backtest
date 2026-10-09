@@ -21,6 +21,7 @@ BacktestConfig = backend.engine.BacktestConfig
 COMPARISON_LABELS = backend.engine.COMPARISON_LABELS
 DEFAULT_UNIVERSE = backend.engine.DEFAULT_UNIVERSE
 run_backtest = backend.engine.run_backtest
+STRATEGIES = backend.engine.STRATEGIES
 load_us_universe = backend.universe.load_us_universe
 st.title("Buyntiq · Portfolio Backtest")
 st.caption("Choose your stock universe, historical period, and how often the portfolio is rebuilt.")
@@ -45,6 +46,9 @@ frequencies = {
 
 with st.sidebar:
     st.header("Backtest settings")
+    ranking_strategy = st.selectbox("Ranking strategy", list(STRATEGIES), format_func=STRATEGIES.get)
+    if ranking_strategy != "legacy":
+        st.caption("Research comparison. Shared ML uses a purged historical validation gate; failed validation falls back to momentum. This is not the production Buyntiq model.")
     period = st.radio("Historical period", ["Years back", "Custom dates"], horizontal=True)
     end = st.date_input("End date", value=latest_day, max_value=latest_day, min_value=pd.Timestamp("1980-01-02").date())
     if period == "Years back":
@@ -104,14 +108,22 @@ if st.button("Run backtest", type="primary", use_container_width=True):
             horizon=horizon, holdings=holdings, starting_cash=starting_cash, profile=profile,
             benchmark=benchmark, positive_forecast_only=positive, transaction_cost_bps=costs,
             whole_shares=whole, model_mode="fast" if speed.startswith("Fast") else "full", finalists=int(finalists),
-            min_market_cap=float(min_cap)*1e9, min_price=float(min_price), min_dollar_volume=float(min_liquidity)*1e6)
+            min_market_cap=float(min_cap)*1e9, min_price=float(min_price), min_dollar_volume=float(min_liquidity)*1e6,
+            ranking_strategy=ranking_strategy)
         result = run_backtest(symbols, cfg, progress=lambda f,m:bar.progress(min(max(float(f),0),1),text=m))
         st.session_state["backtest_result"] = result
         st.session_state["backtest_config"] = asdict(cfg)
         st.session_state["backtest_build"] = backend.build
         st.session_state["backtest_scope"] = scope
         st.session_state["backtest_symbols"] = symbols
+        st.session_state.pop("backtest_failure", None)
+        signature = json.dumps({k:v for k,v in asdict(cfg).items() if k != "ranking_strategy"}, sort_keys=True) + json.dumps(symbols)
+        if st.session_state.get("comparison_signature") != signature:
+            st.session_state["strategy_results"] = {}
+        st.session_state["comparison_signature"] = signature
+        st.session_state["strategy_results"][ranking_strategy] = result
     except Exception as exc:
+        st.session_state["backtest_failure"] = True
         st.error(f"Backtest could not finish: {exc}")
     finally:
         bar.empty()
@@ -122,6 +134,9 @@ if result is not None:
     s = result["summary"]
     interval = f"{saved['rebalance_weeks']} week(s)" if saved.get("rebalance_weeks") else f"{saved['rebalance_months']} month(s)"
     st.subheader("Saved run results")
+    if st.session_state.get("backtest_failure"):
+        st.warning("The latest attempt failed. These are the previous completed run's results.")
+    st.caption(f"Strategy: {STRATEGIES.get(saved.get('ranking_strategy', 'legacy'))}")
     st.caption(f"{saved['start']} to {saved['end']} · rebuild every {interval} · {st.session_state['backtest_scope']} · {result['universe_downloaded']:,}/{result['universe_requested']:,} stock histories loaded. Changes above apply when you run again.")
     st.caption(f"Run filters: estimated market cap ≥ ${saved.get('min_market_cap',0)/1e9:g}B · historical price ≥ ${saved.get('min_price',0):g} · median daily trading value ≥ ${saved.get('min_dollar_volume',0)/1e6:g}M. A zero threshold means that filter was disabled.")
     for message in result.get("warnings",[]):
@@ -174,6 +189,25 @@ if result is not None:
         st.download_button("Download benchmark comparison CSV",result["comparison_stats"].to_csv(index=False),"buyntiq_backtest_comparisons.csv","text/csv")
         st.download_button("Download benchmark curves CSV",chart.to_csv(),"buyntiq_backtest_curves.csv","text/csv")
         st.download_button("Download run settings",json.dumps({**saved,"scope":st.session_state["backtest_scope"],"universe":st.session_state["backtest_symbols"]},indent=2),"buyntiq_backtest_settings.json","application/json")
+    diagnostics = result.get("model_diagnostics", pd.DataFrame())
+    if not diagnostics.empty:
+        with st.expander("Shared model validation"):
+            st.dataframe(diagnostics, hide_index=True, use_container_width=True)
+            st.download_button("Download model validation", diagnostics.to_csv(index=False), "buyntiq_model_validation.csv", "text/csv")
+    stored = st.session_state.get("strategy_results", {})
+    if len(stored) > 1:
+        st.subheader("Strategy comparison · identical settings")
+        rows = [{"Strategy": STRATEGIES[key], "Return": value['summary']['total_return'],
+                 "Edge vs benchmark": value['summary']['alpha_vs_benchmark'],
+                 "Maximum drawdown": value['summary']['max_drawdown'],
+                 "Costs ($)": value['summary']['transaction_costs']} for key, value in stored.items()]
+        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+    st.subheader("Returns by calendar year")
+    annual = result['equity'][['portfolio']].join(result['comparisons']).pct_change(fill_method=None)
+    annual.iloc[0, 0] = result['equity'].portfolio.iloc[0] / saved['starting_cash'] - 1
+    annual = (1 + annual).groupby(annual.index.year).prod(min_count=1) - 1
+    st.dataframe(annual.style.format("{:+.1%}"), use_container_width=True)
+    st.caption("First and last years may be partial. Benchmark observations use the matching available period.")
     if result.get("download_errors"):
         with st.expander(f"Unavailable price histories ({len(result['download_errors']):,})"):
             errors=pd.DataFrame(result["download_errors"].items(),columns=["Ticker","Reason"])
