@@ -5,6 +5,8 @@ public before the signal day (one-day publication lag), adjusted for intervening
 splits. Only domestic 10-K/10-Q entity-wide, single-listed-class counts are used.
 """
 from collections import defaultdict
+from functools import lru_cache
+import gzip
 import hashlib
 import json
 import os
@@ -64,6 +66,37 @@ def _cached_json(url):
     return result
 
 
+@lru_cache(maxsize=1)
+def _bundled_share_histories():
+    """Official SEC dated share observations generated outside Streamlit Cloud.
+
+    None means no bundle has been published yet. An old bundle is rejected
+    rather than silently pretending its historical filing coverage is current.
+    """
+    path = Path(__file__).resolve().parent / "data" / "sec_shares.json.gz"
+    if not path.exists():
+        return None
+    try:
+        with gzip.open(path, "rt", encoding="utf-8") as source:
+            payload = json.load(source)
+        retrieved = pd.Timestamp(payload["retrieved_at"])
+        if retrieved.tzinfo is None:
+            retrieved = retrieved.tz_localize("UTC")
+        if pd.Timestamp.now(tz="UTC") - retrieved > pd.Timedelta(days=30):
+            raise EligibilityProviderError(
+                "Bundled SEC share-history data are older than 30 days. "
+                "Run the refresh SEC cache GitHub Action before testing."
+            )
+        concepts = payload["concepts"]
+        if not isinstance(concepts, dict) or len(concepts) < 500:
+            raise ValueError("SEC bundle has insufficient issuer coverage")
+        return concepts
+    except EligibilityProviderError:
+        raise
+    except (OSError, EOFError, ValueError, KeyError, TypeError) as exc:
+        raise EligibilityProviderError("Bundled SEC share-history cache is corrupt or incomplete.") from exc
+
+
 def share_observation(concept, as_of, max_age_days=180):
     """Return a mature original observation; never use future/restated counts."""
     rows = (concept or {}).get('units', {}).get('shares', [])
@@ -94,6 +127,8 @@ def share_observation(concept, as_of, max_age_days=180):
 class HistoricalSizeStore:
     def __init__(self, fetch=None):
         self.fetch = fetch or _cached_json
+        self._use_bundle = fetch is None
+        self._bundle = _bundled_share_histories() if self._use_bundle else None
         self._mapping = None
         self._classes = defaultdict(set)
         self._concepts = {}
@@ -101,20 +136,34 @@ class HistoricalSizeStore:
 
     def _load_mapping(self):
         if self._mapping is None:
-            try:
-                raw = self.fetch('https://www.sec.gov/files/company_tickers.json')
-            except EligibilityProviderError:
-                # This is an identifier directory, never a substitute for
-                # historical fundamentals. Every share count is still dated.
-                snapshot = Path(__file__).resolve().parent / 'data' / 'sec_tickers.json'
-                if not snapshot.exists():
-                    raise
+            # Prefer the SEC directory shipped with the cache when we have
+            # bundled issuer histories. Streamlit need not contact www.sec.gov.
+            snapshot = Path(__file__).resolve().parent / 'data' / 'sec_tickers.json'
+            if self._bundle is not None and snapshot.exists():
                 saved = json.loads(snapshot.read_text())
                 retrieved = pd.Timestamp(saved['retrieved_at'])
+                if retrieved.tzinfo is None:
+                    retrieved = retrieved.tz_localize('UTC')
                 if pd.Timestamp.now(tz='UTC') - retrieved > pd.Timedelta(days=30):
-                    raise EligibilityProviderError('SEC ticker directory is blocked and the bundled directory is over 30 days old. Refresh the directory snapshot; the size filter remains enabled.')
-                raw = {s:{'ticker':s,'cik_str':cik} for s,cik in saved['tickers'].items()}
-                self.mapping_note = f"SEC live ticker directory unavailable; using official directory snapshot from {retrieved.date()}. Historical share counts still require dated filings."
+                    raise EligibilityProviderError('Bundled SEC ticker directory is older than 30 days. Refresh the SEC data bundle.')
+                raw = {s: {'ticker': s, 'cik_str': cik} for s, cik in saved['tickers'].items()}
+                self.mapping_note = f"Official SEC dated-filing snapshot ({retrieved.date()}); no live SEC calls required."
+            else:
+                try:
+                    raw = self.fetch('https://www.sec.gov/files/company_tickers.json')
+                except EligibilityProviderError:
+                    # Ticker mapping is only an identifier: share counts still
+                    # come from original dated SEC filings, never today's cap.
+                    if not snapshot.exists():
+                        raise
+                    saved = json.loads(snapshot.read_text())
+                    retrieved = pd.Timestamp(saved['retrieved_at'])
+                    if retrieved.tzinfo is None:
+                        retrieved = retrieved.tz_localize('UTC')
+                    if pd.Timestamp.now(tz='UTC') - retrieved > pd.Timedelta(days=30):
+                        raise EligibilityProviderError('SEC directory unavailable and its bundled snapshot is older than 30 days.')
+                    raw = {s: {'ticker': s, 'cik_str': cik} for s, cik in saved['tickers'].items()}
+                    self.mapping_note = f"SEC live ticker directory unavailable; using official snapshot from {retrieved.date()}."
             if not isinstance(raw, dict) or not raw:
                 raise EligibilityProviderError('SEC ticker mapping is unavailable; cannot apply the market-cap floor.')
             self._mapping = {}
@@ -134,6 +183,11 @@ class HistoricalSizeStore:
         cik = self._mapping.get('AAPL')
         if cik is None:
             raise EligibilityProviderError('SEC directory failed its identifier check.')
+        if self._bundle is not None:
+            self._concepts[cik] = self._bundle.get(str(cik))
+            if not self._concepts[cik]:
+                raise EligibilityProviderError('Official SEC bundle has no AAPL share history; refresh job must finish before a backtest.')
+            return
         self._concepts[cik] = self.fetch(
             f'https://data.sec.gov/api/xbrl/companyconcept/CIK{cik:010d}/dei/EntityCommonStockSharesOutstanding.json')
         if not self._concepts[cik]:
@@ -147,8 +201,11 @@ class HistoricalSizeStore:
         if len(self._classes[cik]) != 1:
             return None, 'Ambiguous issuer/share-class mapping'
         if cik not in self._concepts:
-            self._concepts[cik] = self.fetch(
-                f'https://data.sec.gov/api/xbrl/companyconcept/CIK{cik:010d}/dei/EntityCommonStockSharesOutstanding.json')
+            if self._bundle is not None:
+                self._concepts[cik] = self._bundle.get(str(cik))
+            else:
+                self._concepts[cik] = self.fetch(
+                    f'https://data.sec.gov/api/xbrl/companyconcept/CIK{cik:010d}/dei/EntityCommonStockSharesOutstanding.json')
         obs = share_observation(self._concepts[cik], as_of)
         if obs is None:
             return None, 'No recent, unambiguous historical shares'
