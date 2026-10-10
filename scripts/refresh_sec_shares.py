@@ -16,9 +16,11 @@ import time
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from universe import load_us_universe
+import sys
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from universe import load_us_universe
 DATA = ROOT / "data"
 BUNDLE = DATA / "sec_shares.json.gz"
 DIRECTORY = DATA / "sec_tickers.json"
